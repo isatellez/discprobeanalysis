@@ -13,8 +13,8 @@ config.do.rasterByMean     = true;
 config.do.permutationTest  = true;
 config.do.spikeAccounting  = true;
 config.do.rayleigh         = true;
-config.do.fourier          = true;
-config.do.fourierQuickFig  = true;
+config.do.fourier          = true;    % to compute FT
+config.do.fourierFig       = true;    % to make that 2x2 diagnostic fig
 config.do.dklSuite         = true;
 config.do.swatches         = true;
 config.do.peakModel        = true;
@@ -53,5 +53,10 @@ config.space.zeroHue = 16;     % which hue sits at 0°
 config.pt.nPerm = 1000;
 config.pt.alpha = 0.05;
 config.pt.seed  = 2025;
+
+% legacy / DiscProbe-v1 style settings
+config.legacy.useLegacySats = true;
+config.legacy.sats          = [0.33 0.66 1];   % the three main ones
+config.legacy.satTol        = 1e-3;            % tolerance for matching
 
 end

@@ -1,181 +1,327 @@
 function plot_spike_accounting(U, stats, COL, config, outDir)
-% Spike accounting figure: spikes/trials per hue, grouped by sat, cosine fit
-% based on SPIKE ACCOUNTING section in Analyze_DiscProbePSTHs_v1figproc.m
 
 if U.nTrials == 0
     return;
 end
 
-win = U.winEarly;
-dur = diff(win);
-
-nTr = numel(U.spk);
-spkCount = nan(nTr,1);
-rate     = nan(nTr,1);
-
-for tt = 1:nTr
-    spks = U.spk{tt};
-    if isempty(spks)
-        spkCount(tt) = 0;
-        rate(tt)     = 0;
-    else
-        spks = spks(spks >= win(1) & spks < win(2));
-        spkCount(tt) = numel(spks);
-        rate(tt)     = spkCount(tt) ./ dur;
-    end
-end
-
-hueID = U.trials.hueID;
-satID = U.trials.satID;
-
-valid = isfinite(hueID) & isfinite(satID) & isfinite(rate);
-hueID = hueID(valid);
-satID = satID(valid);
-spkCount = spkCount(valid);
-rate     = rate(valid);
-
-if isempty(hueID)
-    return;
-end
-
-hues = unique(hueID);
-hues = hues(:);
-nHue = max(hues);
-
-% spikes per hue
-spikesPerHue = accumarray(hueID, spkCount, [nHue 1], @sum, 0);
-
-% trials per hue and sat
-sats = unique(satID);
-sats = sats(:);
-nS   = numel(sats);
-
-trialCounts = accumarray([hueID, satID_index(satID, sats)], 1, [nHue nS], @sum, 0);
-
-% mean rate per hue from stats
-if isfield(stats, 'hueMeans') && isfield(stats.hueMeans, 'rate_mean')
-    R_h = nan(nHue,1);
-    hm = stats.hueMeans;
-    R_h(hm.hues) = hm.rate_mean;
-else
-    R_h = accumarray(hueID, rate, [nHue 1], @mean, NaN);
-end
-
-R_norm = R_h;
-R_norm = R_norm - min(R_norm,[],'omitnan');
-den = max(R_norm,[],'omitnan');
-if den > 0
-    R_norm = R_norm ./ den;
-end
-
-% cosine fit if available
-hasCos = isfield(stats, 'cosine') && isfield(stats.cosine, 'y_hat');
-if hasCos
-    y_hat = stats.cosine.y_hat;
-    if numel(y_hat) ~= nHue
-        hasCos = false;
-    end
-end
-
+% plotting flags
 makePlots = true;
-if isfield(config, 'plot') && isfield(config.plot, 'makePlots')
+if isfield(config,'plot') && isfield(config.plot,'makePlots')
     makePlots = logical(config.plot.makePlots);
 end
-figVis = iff(makePlots,'on','off');
+figVis = 'on';
+if ~makePlots
+    figVis = 'off';
+end
 
 pngDpi = 300;
-if isfield(config, 'plot') && isfield(config.plot, 'dpi')
+if isfield(config,'plot') && isfield(config.plot,'dpi')
     pngDpi = config.plot.dpi;
 end
 
 unitDir = fullfile(outDir, sprintf('%s_%d', U.unitType, U.unitID));
 if ~exist(unitDir,'dir'), mkdir(unitDir); end
 
-f = figure('Visible',figVis,'Color','w');
-t = tiledlayout(f,2,3,'TileSpacing','compact','Padding','compact');
+% -------------------------------------------------------------------------
+% trial-level early window firing (same as boxplots / outliers)
+% -------------------------------------------------------------------------
+win = U.winEarly;
+dur = diff(win);
 
-% spikes per hue
-ax1 = nexttile(t,1);
-bar(ax1, 1:nHue, spikesPerHue);
-xlabel(ax1,'Hue index');
-ylabel(ax1,'Spikes (early window)');
-title(ax1,'Total spikes per hue');
-grid(ax1,'on');
-
-% trials per hue × sat
-ax2 = nexttile(t,2);
-hb = bar(ax2, trialCounts, 'grouped');
-xlabel(ax2,'Hue index');
-ylabel(ax2,'Trials');
-title(ax2,'Trials per hue (by sat)');
-grid(ax2,'on');
-
-legend(ax2, compose('sat=%.2f', sats), 'Location','northeastoutside');
-
-% normalized mean + cosine fit
-ax3 = nexttile(t,3);
-b3 = bar(ax3, 1:nHue, R_norm);
-b3.FaceAlpha = 0.7;
-hold(ax3,'on');
-
-if hasCos
-    hx = 1:nHue;
-    yhat_norm = y_hat;
-    yhat_norm = yhat_norm - min(yhat_norm,[],'omitnan');
-    d2 = max(yhat_norm,[],'omitnan');
-    if d2 > 0
-        yhat_norm = yhat_norm ./ d2;
+nTr = numel(U.spk);
+rateEarly = nan(nTr,1);
+for tt = 1:nTr
+    spks = U.spk{tt};
+    if isempty(spks)
+        rateEarly(tt) = 0;
+    else
+        spks = spks(spks >= win(1) & spks < win(2));
+        rateEarly(tt) = numel(spks) / dur;
     end
-    plot(ax3, hx, yhat_norm, 'k--','LineWidth',2);
 end
 
-xlabel(ax3,'Hue index');
-ylabel(ax3,'Normalized mean rate');
-title(ax3,'Normalized tuning ± cosine fit');
+% normalize 0–1 like spk_early_norm in the legacy script
+r = rateEarly;
+r = r - min(r);
+denom = max(r);
+if denom <= 0
+    spk_early_norm = zeros(size(r));
+else
+    spk_early_norm = r ./ denom;
+end
+
+hueID = U.trials.hueID;
+satID = U.trials.satID;
+
+% basic hue / sat info
+if isfield(COL,'nHue')
+    nHue = COL.nHue;
+else
+    nHue = max(hueID(~isnan(hueID)));
+end
+
+ZERO_HUE = 1;
+if isfield(config,'space') && isfield(config.space,'zeroHue')
+    ZERO_HUE = config.space.zeroHue;
+end
+
+saturIDs = unique(satID(~isnan(satID)));
+saturIDs = saturIDs(:).';
+nS       = numel(saturIDs);
+
+[~, satIdx_u] = ismember(satID, saturIDs);
+hueIdx_u      = hueID;
+
+% -------------------------------------------------------------------------
+% mean normalized rate per hue and per hue×sat (R_h, R_hs) + N_hs
+% -------------------------------------------------------------------------
+R_h  = nan(nHue,1);
+N_h  = zeros(nHue,1);
+
+for h = 1:nHue
+    sel = (hueIdx_u == h);
+    vals = spk_early_norm(sel);
+    R_h(h) = mean(vals, 'omitnan');
+    N_h(h) = sum(sel);
+end
+
+R_hs = nan(nHue, nS);
+N_hs = zeros(nHue, nS);
+
+for si = 1:nS
+    sVal = saturIDs(si);
+    selS = (satIdx_u == si);
+    for h = 1:nHue
+        sel = selS & (hueIdx_u == h);
+        vals = spk_early_norm(sel);
+        R_hs(h,si) = mean(vals, 'omitnan');
+        N_hs(h,si) = sum(sel);
+    end
+end
+
+% clean NaNs for plotting / cosine fits (same as legacy)
+R_h(~isfinite(R_h)) = 0;
+for si = 1:size(R_hs,2)
+    col = R_hs(:,si);
+    col(~isfinite(col)) = 0;
+    R_hs(:,si) = col;
+end
+
+% color table per sat×hue (cols_satur2)
+cols_satur2 = [];
+if isfield(COL,'colsSatur') && ~isempty(COL.colsSatur)
+    sz = size(COL.colsSatur);                  % nSat x nHue x 3
+    cols_satur2 = reshape(double(COL.colsSatur), sz(1), sz(2), 3);
+end
+
+% -------------------------------------------------------------------------
+% figure layout copied from DO_SPIKE_ACCOUNTING
+% -------------------------------------------------------------------------
+rootVis0 = get(groot,'DefaultFigureVisible');
+set(groot,'DefaultFigureVisible','off');
+cleanupFigVis = onCleanup(@() set(groot,'DefaultFigureVisible', rootVis0));
+
+figAcc = figure('Name','Spike accounting','Color','w','Visible',figVis);
+figAcc.Units    = 'normalized';
+figAcc.Position = [0.1 0.1 0.8 0.8];
+
+LM = 0.08; RM = 0.035; GAPX = 0.065;
+Wax = (1 - LM - RM - 2*GAPX) / 3;
+Xs  = [LM, LM+Wax+GAPX, LM+2*(Wax+GAPX)];
+footerH      = 0.045;
+yFooter      = 0.018;
+labH         = 0.030;
+gapAftFooter = 0.018;
+gapRows      = 0.085;
+axH          = 0.295;
+
+yBot = yFooter + footerH + gapAftFooter + labH;
+yTop = yBot + axH + gapRows + labH;
+
+ax1 = axes('Parent',figAcc,'Units','normalized','Position',[Xs(1) yTop Wax axH]);
+ax2 = axes('Parent',figAcc,'Units','normalized','Position',[Xs(2) yTop Wax axH]);
+ax3 = axes('Parent',figAcc,'Units','normalized','Position',[Xs(3) yTop Wax axH]);
+ax4 = axes('Parent',figAcc,'Units','normalized','Position',[Xs(1) yBot Wax axH]);
+ax5 = axes('Parent',figAcc,'Units','normalized','Position',[Xs(2) yBot Wax axH]);
+ax6 = axes('Parent',figAcc,'Units','normalized','Position',[Xs(3) yBot Wax axH]);
+
+axSat = [ax3, ax4, ax5, ax6];   % overall + first 3 sats, like legacy
+
+% -------------------------------------------------------------------------
+% top-left: grouped mean normalized rate by hue×sat
+% -------------------------------------------------------------------------
+axes(ax1); cla(ax1);
+bh = bar(ax1, R_hs, 'grouped'); hold(ax1,'on');
+if ~isempty(cols_satur2)
+    nSatCols = size(cols_satur2,1);
+    for s = 1:min(nS, numel(bh))
+        satRow = min(s, nSatCols);
+        c = squeeze(cols_satur2(satRow,1:nHue,:));
+        c = double(c);
+        if max(c(:)) > 1, c = c/255; end
+        bh(s).FaceColor = 'flat';
+        bh(s).CData     = c;
+    end
+end
+xlabel(ax1,'Hue');
+ylabel(ax1,'Normalized mean spike rate (0–1)');
+lg1 = legend(ax1, compose('sat=%.2f',saturIDs), ...
+    'Location','northeastoutside','AutoUpdate','off');
+if ~makePlots
+    set(lg1,'Visible','off');
+end
+title(ax1,'Normalized mean spike rate per hue (grouped)');
+grid(ax1,'on');
+xlim(ax1,[0.5, nHue+0.5]);
+
+% -------------------------------------------------------------------------
+% top-mid: grouped trial counts per hue×sat
+% -------------------------------------------------------------------------
+axes(ax2); cla(ax2);
+bt = bar(ax2, N_hs, 'grouped'); hold(ax2,'on');
+if ~isempty(cols_satur2)
+    nSatCols = size(cols_satur2,1);
+    for s = 1:min(nS, numel(bt))
+        satRow = min(s, nSatCols);
+        c = squeeze(cols_satur2(satRow,1:nHue,:));
+        c = double(c);
+        if max(c(:)) > 1, c = c/255; end
+        bt(s).FaceColor = 'flat';
+        bt(s).CData     = c;
+    end
+end
+xlabel(ax2,'Hue');
+ylabel(ax2,'Trials');
+lg2 = legend(ax2, compose('sat=%.2f',saturIDs), ...
+    'Location','northeastoutside','AutoUpdate','off');
+if ~makePlots
+    set(lg2,'Visible','off');
+end
+title(ax2,'Trials per hue (grouped)');
+grid(ax2,'on');
+xlim(ax2,[0.5, nHue+0.5]);
+
+% -------------------------------------------------------------------------
+% cosine fit helper (same model as legacy fit_sine_hues)
+% -------------------------------------------------------------------------
+[aT, ampT, phT, RsqT] = fit_sine_hues_local(R_h);
+
+stepDeg  = 360 / nHue;
+shiftDeg = stepDeg * (ZERO_HUE - 1);
+peakT    = mod(-phT - shiftDeg, 360);
+
+% -------------------------------------------------------------------------
+% top-right: overall normalized mean + cosine fit
+% -------------------------------------------------------------------------
+axes(ax3); cla(ax3);
+b3 = bar(ax3, 1:nHue, R_h); hold(ax3,'on');
+b3.FaceColor = 'flat';
+if ~isempty(cols_satur2)
+    satRow = size(cols_satur2,1);   % highest sat row, like legacy
+    c = squeeze(cols_satur2(satRow,1:nHue,:));
+    c = double(c);
+    if max(c(:)) > 1, c = c/255; end
+    b3.CData = c;
+end
+xlabel(ax3,'Hue');
+ylabel(ax3,'Normalized mean spike rate (0–1)');
+title(ax3,'Normalized mean spike rate (overall)');
 grid(ax3,'on');
+xlim(ax3,[0.5, nHue+0.5]);
 
-% bottom row: throw summary text
-ax4 = nexttile(t, [1 3]);
-axis(ax4,'off');
+hx = linspace(1, nHue, 300);
+plot(ax3, hx, aT + ampT*cos(2*pi*(hx-1)/nHue + deg2rad(phT)), ...
+    'k--', 'LineWidth', 2);
 
-txt = {
-    sprintf('Date: %s', string(U.dateStr))
-    sprintf('Unit %d (%s)', U.unitID, U.unitType)
-    sprintf('nTrials = %d', numel(rate))
-    sprintf('Total spikes (early window) = %d', sum(spkCount))
-    };
+txtPeak = sprintf('peak ≈ %.0f°', peakT);
+yl = ylim(ax3);
+text(ax3, 0.02, 0.95, txtPeak, ...
+    'Units','normalized','HorizontalAlignment','left', ...
+    'VerticalAlignment','top');
 
-if hasCos && isfield(stats.cosine, 'amp') && isfield(stats.cosine, 'pref_deg')
-    txt{end+1} = sprintf('Cosine amp = %.3f', stats.cosine.amp);
-    txt{end+1} = sprintf('Pref angle = %.1f°', stats.cosine.pref_deg);
+% -------------------------------------------------------------------------
+% bottom row: per-sat mean + cosine fit (first 3 sats)
+% -------------------------------------------------------------------------
+nPlotSat = min(nS, 3);
+for si = 1:nPlotSat
+    ax  = axSat(si+1);
+    ysi = R_hs(:,si);
+
+    axes(ax); cla(ax);
+    b = bar(ax, 1:nHue, ysi); hold(ax,'on');
+
+    b.FaceColor = 'flat';
+    if ~isempty(cols_satur2)
+        nSatCols = size(cols_satur2,1);
+        satRow   = min(si, nSatCols);
+        c = squeeze(cols_satur2(satRow,1:nHue,:));
+        c = double(c);
+        if max(c(:)) > 1, c = c/255; end
+        b.CData = c;
+    end
+
+    xlabel(ax,'Hue');
+    ylabel(ax,'Normalized mean spike rate (0–1)');
+    title(ax, sprintf('sat=%.2f', saturIDs(si)));
+    grid(ax,'on');
+    xlim(ax,[0.5, nHue+0.5]);
+
+    [ai,ampi,phi,Rsqi] = fit_sine_hues_local(ysi);
+
+    hx = linspace(1, nHue, 300);
+    plot(ax, hx, ai + ampi*cos(2*pi*(hx-1)/nHue + deg2rad(phi)), ...
+        'k--', 'LineWidth', 1.5);
+
+    peakSi = mod(-phi - shiftDeg, 360);
+    txt = sprintf('peak ≈ %.0f°', peakSi);
+    text(ax, 0.02, 0.95, txt, ...
+        'Units','normalized','HorizontalAlignment','left', ...
+        'VerticalAlignment','top');
 end
 
-if isfield(stats, 'permutation') && isfield(stats.permutation,'p')
-    txt{end+1} = sprintf('Permutation p (tuning structure) = %.3g', stats.permutation.p);
+% global title
+if isfield(U,'exptName')
+    ttl = sprintf('%s | Unit %d (%s) — Spike accounting', ...
+        string(U.exptName), U.unitID, U.unitType);
+else
+    ttl = sprintf('%s | Unit %d (%s) — Spike accounting', ...
+        string(U.dateStr), U.unitID, U.unitType);
 end
+sgtitle(figAcc, ttl, 'Interpreter','none');
 
-text(ax4, 0.01, 0.9, txt, 'Units','normalized','VerticalAlignment','top');
-
-title(ax4,'Spike accounting summary','FontWeight','bold');
-
+% save
 fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
 pngName = fullfile(unitDir, sprintf('SpikeAccounting_%s.png', fileTag));
 figName = fullfile(unitDir, sprintf('SpikeAccounting_%s.fig', fileTag));
 
-exportgraphics(f, pngName, 'Resolution', pngDpi);
-savefig(f, figName);
+exportgraphics(figAcc, pngName, 'Resolution', pngDpi);
+savefig(figAcc, figName);
 
 if ~makePlots
-    close(f);
+    close(figAcc);
 end
 
 end
 
-function idx = satID_index(satID, sats)
-    [~, idx] = ismember(satID, sats);
-    idx(idx == 0) = 1;  % should never really happen if sats built from satID
+% -------------------------------------------------------------------------
+function [a, amp, ph, Rsq] = fit_sine_hues_local(y)
+y = y(:);
+n = numel(y);
+h = (1:n).';
+X = [ones(n,1), cos(2*pi*(h-1)/n), sin(2*pi*(h-1)/n)];
+beta = X \ y;
+a    = beta(1);
+B    = beta(2);
+C    = beta(3);
+amp  = sqrt(B.^2 + C.^2);
+ph   = atan2(-C, B);              % note sign to match legacy
+ph   = rad2deg(ph);
+yhat = X*beta;
+SSres = sum((y - yhat).^2);
+SStot = sum((y - mean(y)).^2);
+if SStot > 0
+    Rsq = 1 - SSres/SStot;
+else
+    Rsq = NaN;
 end
-
-function out = iff(cond, a, b)
-    if cond, out = a; else, out = b; end
 end
