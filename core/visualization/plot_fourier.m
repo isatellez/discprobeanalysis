@@ -4,11 +4,12 @@ if ~isfield(stats, 'fourier') || isempty(stats.fourier)
     return;
 end
 
-FT = stats.fourier;
-FT_over = FT.over;
-FT_sat  = FT.perSat;
+FT       = stats.fourier;
+FT_over  = FT.over;
+FT_sat   = FT.perSat;
 saturIDs = FT.saturIDs;
 
+% figure visibility
 makePlots = true;
 if isfield(config, 'plot') && isfield(config.plot, 'makePlots')
     makePlots = logical(config.plot.makePlots);
@@ -18,16 +19,54 @@ if ~makePlots
     figVis = 'off';
 end
 
-unitDir = fullfile(outDir, sprintf('%s_%d', U.unitType, U.unitID));
-if ~exist(unitDir,'dir'), mkdir(unitDir); end
+% ---------- paths: per-unit, per-session, global ----------
+
+dateStr  = char(string(U.dateStr));
+unitType = char(string(U.unitType));
+unitID   = U.unitID;
+
+
+% per-unit dir: units/<unit>/figures/discprobe/fourier
+Upaths  = get_unit_paths(config, dateStr, unitType, unitID);
+unitDir = Upaths.figures;
+if ~exist(unitDir,'dir')
+    mkdir(unitDir);
+end
+
+
+% per-session dir: <date>/figs/discprobe/fourier
+if nargin < 5 || isempty(outDir)
+    outDir = '';
+end
+sessionDir = '';
+if ~isempty(outDir)
+    sessionDir = fullfile(outDir, 'fourier');
+    if ~exist(sessionDir,'dir')
+        mkdir(sessionDir);
+    end
+end
+
+% global dir: output/figs/discprobe/fourier
+globalDir = '';
+if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
+        && ~isempty(config.paths.globalDiscProbeFigRoot)
+    globalDir = fullfile(config.paths.globalDiscProbeFigRoot, 'fourier');
+    if ~exist(globalDir,'dir')
+        mkdir(globalDir);
+    end
+end
+
+% ---------- plotting ----------
 
 figF = figure('Color','w','Visible',figVis,'Name','Hue Fourier');
 TLf  = tiledlayout(figF,2,2,'Padding','compact','TileSpacing','compact');
 
 if isfield(U,'exptName')
-    unitLabel = sprintf('%s | Unit %d (%s) — Hue Fourier', string(U.exptName), U.unitID, U.unitType);
+    unitLabel = sprintf('%s | Unit %d (%s) — Hue Fourier', ...
+        string(U.exptName), U.unitID, U.unitType);
 else
-    unitLabel = sprintf('%s | Unit %d (%s) — Hue Fourier', string(U.dateStr), U.unitID, U.unitType);
+    unitLabel = sprintf('%s | Unit %d (%s) — Hue Fourier', ...
+        string(U.dateStr), U.unitID, U.unitType);
 end
 sgtitle(figF, unitLabel, 'Interpreter','none');
 
@@ -76,17 +115,36 @@ ylabel(ax,'Phase k=1 (deg)');
 title(ax,'First-harmonic phase (per sat)');
 grid(ax,'on');
 
+% ---------- save to all three locations ----------
+
 pngDpi = 200;
 if isfield(config, 'plot') && isfield(config.plot, 'dpi')
     pngDpi = config.plot.dpi;
 end
 
 fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
-pngName = fullfile(unitDir, sprintf('FourierHue_quicklook_%s.png', fileTag));
-figName = fullfile(unitDir, sprintf('FourierHue_quicklook_%s.fig', fileTag));
 
-exportgraphics(figF, pngName, 'Resolution', pngDpi);
-savefig(figF, figName);
+% per-unit
+png_unit = fullfile(unitDir, sprintf('FourierHue_quicklook_%s.png', fileTag));
+fig_unit = fullfile(unitDir, sprintf('FourierHue_quicklook_%s.fig', fileTag));
+exportgraphics(figF, png_unit, 'Resolution', pngDpi);
+savefig(figF, fig_unit);
+
+% per-session
+if ~isempty(sessionDir)
+    png_sess = fullfile(sessionDir, sprintf('FourierHue_quicklook_%s.png', fileTag));
+    fig_sess = fullfile(sessionDir, sprintf('FourierHue_quicklook_%s.fig', fileTag));
+    exportgraphics(figF, png_sess, 'Resolution', pngDpi);
+    savefig(figF, fig_sess);
+end
+
+% global
+if ~isempty(globalDir)
+    png_glob = fullfile(globalDir, sprintf('FourierHue_quicklook_%s.png', fileTag));
+    fig_glob = fullfile(globalDir, sprintf('FourierHue_quicklook_%s.fig', fileTag));
+    exportgraphics(figF, png_glob, 'Resolution', pngDpi);
+    savefig(figF, fig_glob);
+end
 
 if ~makePlots
     close(figF);

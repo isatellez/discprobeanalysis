@@ -1,11 +1,11 @@
 function U = prepare_unit(S, unitIdx, Tidx, config)
-% Build per-unit struct U from session S and trial table Tidx.
+% build per unit struct U from session S and trial table Tidx.
 
 U = struct();
 
 % basic metadata
 U.dateStr = S.dateStr;
-U.unitID  = S.unitIDs(unitIdx);
+U.unitID  = S.phyIDs(unitIdx);
 U.idx     = unitIdx;
 
 % SU vs MU based on ExptInfo counts
@@ -30,16 +30,41 @@ if height(Tidx) ~= nTrials_full
         height(Tidx), nTrials_full);
 end
 
+% start with all trials
+keep = true(nTrials_full,1);
+
 % default: keep only trials with valid color IDs
 % (matches keep = ~isnan(trType_full(:,1)) in the original v1figproc script)
 if ismember('hueID', Tidx.Properties.VariableNames)
-    keep = ~isnan(Tidx.hueID);
-else
-    keep = true(nTrials_full,1);
+    keep = keep & ~isnan(Tidx.hueID);
+end
+
+% optional gating by saturation / elevation / hue from config
+if isfield(config, 'trials')
+    % saturation IDs that we're using
+    if isfield(config.trials, 'includeSat') && ...
+            ismember('satID', Tidx.Properties.VariableNames) && ...
+            ~isempty(config.trials.includeSat)
+        keep = keep & ismember(Tidx.satID, config.trials.includeSat);
+    end
+
+    % elevation IDs that we're using
+    if isfield(config.trials, 'includeElev') && ...
+            ismember('elevID', Tidx.Properties.VariableNames) && ...
+            ~isempty(config.trials.includeElev)
+        keep = keep & ismember(Tidx.elevID, config.trials.includeElev);
+    end
+
+    % we wouldn't really do this but hue subset if we ever want it
+    if isfield(config.trials, 'includeHue') && ...
+            ismember('hueID', Tidx.Properties.VariableNames) && ...
+            ~isempty(config.trials.includeHue)
+        keep = keep & ismember(Tidx.hueID, config.trials.includeHue);
+    end
 end
 
 if ~any(keep)
-    error('prepare_unit: no trials left after applying color-ID mask.');
+    error('prepare_unit: no trials left after applying color-ID mask and gating.');
 end
 
 spk_cell = spk_full(keep);
@@ -58,7 +83,8 @@ U.spk     = spk_cell;
 U.mrk     = mrk_cell;
 U.trials  = Tunit;
 
-% time windows: pull from config if present, otherwise fall back to sane defaults
+% time windows (pull from config if present, otherwise fall back to
+% defaults)
 if isfield(config, 'time')
     if isfield(config.time, 'winEarly')
         U.winEarly = config.time.winEarly;

@@ -1,7 +1,7 @@
 function expFile = locate_expTrialsDisc(PATHS, MONKEY, date6)
-% find the ExpTrialsDisc file for a given date
+% find the ExpTrialsDisc .mat file for a date
 
-    % canonical location: /DiscProbe/250513/Jacomo_250513_ExpTrialsDisc.mat
+    %location should be /DiscProbe/250513/Jacomo_250513_ExpTrialsDisc.mat
     cand1 = fullfile(PATHS.baseDiscProbeLocal, date6, ...
                      sprintf('%s_%s_ExpTrialsDisc.mat', MONKEY, date6));
     if isfile(cand1)
@@ -9,7 +9,7 @@ function expFile = locate_expTrialsDisc(PATHS, MONKEY, date6)
         return;
     end
 
-    % fallback: search anywhere under baseDiscProbeLocal
+    % but you can also search anywhere under baseDiscProbeLocal
     pat = sprintf('*%s*ExpTrialsDisc.mat', date6);
     D = dir(fullfile(PATHS.baseDiscProbeLocal, '**', pat));
 

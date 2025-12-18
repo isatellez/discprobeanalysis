@@ -1,0 +1,597 @@
+% ===== FILE: build_extended_color_metadata.m =====
+% ===== START =====
+function META = build_extended_color_metadata(DATES)
+% Scan ExpTrialsDisc files and collect all unique DiscProbe RGBs
+% plus which ones are already in DiscProbeColsUpdated and which are new.
+%
+% This does not change the main analysis. It just writes out a metadata
+% .mat and .csv you can use later.
+
+clc;
+
+rootDir = fileparts(mfilename('fullpath'));
+addpath(genpath(rootDir));
+
+config = load_config();
+
+if nargin < 1
+    DATES = [];
+end
+
+monkey = config.monkey;
+
+PATHS = struct();
+PATHS.baseDiscProbeLocal = config.paths.base;
+PATHS.baseDiscProbesCode = config.paths.code;
+PATHS.baseOut            = config.paths.output;
+
+% legacy master from DiscProbeColsUpdated
+colsFile = fullfile(config.paths.code, 'DiscProbeColsUpdated.mat');
+if ~isfile(colsFile)
+    error('Missing DiscProbeColsUpdated.mat at %s', colsFile);
+end
+S = load(colsFile, 'ProbeCols', 'ProbeColIDs');
+
+legacyRGB = double(S.ProbeCols);    % N0 x 3
+legacyIDs = double(S.ProbeColIDs);  % N0 x 6 (hue, sat, elev, ...)
+
+% figure out which dates to scan
+if isempty(DATES)
+    % auto-detect from any *ExpTrialsDisc.mat under base
+    pat = sprintf('%s_*_ExpTrialsDisc.mat', monkey);
+    D = dir(fullfile(PATHS.baseDiscProbeLocal, '**', pat));
+    if isempty(D)
+        error('No ExpTrialsDisc files found under %s', PATHS.baseDiscProbeLocal);
+    end
+    dateList = strings(numel(D),1);
+    for k = 1:numel(D)
+        tok = regexp(D(k).name, '\d{6}', 'match', 'once');
+        if ~isempty(tok)
+            dateList(k) = string(tok);
+        end
+    end
+    dateList = unique(dateList(dateList ~= ""));
+else
+    dateList = normalize_dates(DATES);
+    dateList = string(dateList(:));
+end
+
+allRGB      = [];
+allDates    = strings(0,1);
+
+fprintf('Scanning %d sessions for DiscprobeColor RGBs...\n', numel(dateList));
+
+for d = 1:numel(dateList)
+    dateStr = char(dateList(d));
+    try
+        expFile = locate_expTrialsDisc(PATHS, monkey, dateStr);
+    catch ME
+        warning('Skipping %s: %s', dateStr, ME.message);
+        continue;
+    end
+
+    fprintf('  %s -> %s\n', dateStr, expFile);
+
+    Sexp = load(expFile, 'ExptTrialsDisc');
+    if ~isfield(Sexp, 'ExptTrialsDisc')
+        warning('  %s: no ExptTrialsDisc in file, skipping.', dateStr);
+        continue;
+    end
+
+    ExptTrialsDisc = Sexp.ExptTrialsDisc;
+    if ~iscell(ExptTrialsDisc) && ~istable(ExptTrialsDisc)
+        warning('  %s: ExptTrialsDisc is not a cell/table, skipping.', dateStr);
+        continue;
+    end
+
+    % pull DiscprobeColor per trial into N x 3 matrix
+    try
+        if iscell(ExptTrialsDisc)
+            trlCols = cell2mat( ...
+                cellfun(@(s) double(s.DiscprobeColor(:).'), ...
+                        ExptTrialsDisc(:,1), 'UniformOutput', false) );
+        else
+            % table case: assume a column with structs
+            trlCols = cell2mat( ...
+                cellfun(@(s) double(s.DiscprobeColor(:).'), ...
+                        ExptTrialsDisc.Disc, 'UniformOutput', false) );
+        end
+    catch ME
+        warning('  %s: could not extract DiscprobeColor (%s), skipping.', ...
+                dateStr, ME.message);
+        continue;
+    end
+
+    if isempty(trlCols)
+        continue;
+    end
+
+    allRGB   = [allRGB; trlCols];                 %#ok<AGROW>
+    allDates = [allDates; repmat(string(dateStr), size(trlCols,1), 1)]; %#ok<AGROW>
+end
+
+if isempty(allRGB)
+    error('Did not collect any DiscprobeColor RGBs from the scanned sessions.');
+end
+
+% unique RGBs across all sessions
+[uniqRGB, ~, ic] = unique(allRGB, 'rows');
+nColors = size(uniqRGB,1);
+
+% how many trials used each RGB
+trialCount = accumarray(ic, 1, [nColors 1]);
+
+% earliest date each RGB was seen
+firstDate = strings(nColors,1);
+for k = 1:nColors
+    dks = allDates(ic == k);
+    if isempty(dks)
+        firstDate(k) = "";
+    else
+        firstDate(k) = min(dks);
+    end
+end
+
+% which of these RGBs are already in the legacy ProbeCols table
+[isLegacy, legacyRow] = ismember(uniqRGB, legacyRGB, 'rows');
+
+extraRGB      = uniqRGB(~isLegacy,:);
+extraCount    = trialCount(~isLegacy);
+extraFirst    = firstDate(~isLegacy);
+
+fprintf('\nFound %d unique RGBs total.\n', nColors);
+fprintf('  %d already in DiscProbeColsUpdated.\n', sum(isLegacy));
+fprintf('  %d new RGBs not in DiscProbeColsUpdated.\n', numel(extraCount));
+
+% pack output struct
+META = struct();
+META.legacy.ProbeCols   = legacyRGB;
+META.legacy.ProbeColIDs = legacyIDs;
+
+META.uniqueRGB      = uniqRGB;
+META.uniqueCount    = trialCount;
+META.uniqueFirstDate = firstDate;
+META.isLegacy       = isLegacy;
+META.legacyRow      = legacyRow;
+
+META.extraRGB       = extraRGB;
+META.extraCount     = extraCount;
+META.extraFirstDate = extraFirst;
+
+% handy table of the new stuff
+META.extraTable = table( ...
+    extraRGB(:,1), extraRGB(:,2), extraRGB(:,3), ...
+    extraCount, extraFirst, ...
+    'VariableNames', {'R','G','B','nTrials','firstDate'});
+
+% save to disk for future upgrades
+outMat = fullfile(config.paths.code, 'DiscProbeColorMetadata_extended.mat');
+outCSV = fullfile(config.paths.code, 'DiscProbe_extra_colors.csv');
+
+try
+    save(outMat, 'META');
+    fprintf('Saved extended color metadata to %s\n', outMat);
+catch ME
+    warning('Could not save %s (%s)', outMat, ME.message);
+end
+
+try
+    writetable(META.extraTable, outCSV);
+    fprintf('Saved extra RGB table to %s\n', outCSV);
+catch ME
+    warning('Could not write %s (%s)', outCSV, ME.message);
+end
+
+end
+% ===== END FILE: build_extended_color_metadata.m =====
+
+% ===== FILE: load_color_metadata.m =====
+% ===== START =====
+function COL = load_color_metadata(config)
+
+% load ProbeCols + ProbeColIDs
+colsFile = fullfile(config.paths.code, 'DiscProbeColsUpdated.mat');
+% this file has hue, saturation, elevation, dkl coords, rgb values
+% for the 144 stimuli used in the task
+
+if ~isfile(colsFile)
+    error('Missing DiscProbeColsUpdated.mat at %s', colsFile);
+end
+
+S = load(colsFile);
+
+COL = struct();
+
+COL.probeCols = sanitize_colors(S.ProbeCols);   % nProbes × 3 RGB
+COL.probeIDs  = double(S.ProbeColIDs);          % nProbes × 6: [hue sat elev, dkl]
+
+rgbAll = COL.probeCols;
+ids    = COL.probeIDs;
+
+hueID  = ids(:,1); % hue id (should be integer-like)
+satID  = ids(:,2); % 0.2, 0.33, 0.5, 0.66, 0.8, 1 or similar
+elevID = ids(:,3); % elevation values (e.g. -0.8 ... 0.8)
+
+% make sure hue IDs are integer-ish
+hueID_int = round(hueID);
+if any(abs(hueID_int - hueID) > 1e-6)
+    warning('load_color_metadata: hueID values are not close to integers.');
+end
+hueID = hueID_int;
+
+COL.nHue = max(hueID(:));
+
+% saturation / elevation levels are value-based, not 1..N indexes
+satVals  = unique(satID(~isnan(satID)));
+elevVals = unique(elevID(~isnan(elevID)));
+
+COL.nSat      = numel(satVals);
+COL.nElev     = numel(elevVals);
+COL.satVals   = satVals;
+COL.elevVals  = elevVals;
+
+nHue  = COL.nHue;
+nSat  = COL.nSat;
+nElev = COL.nElev;
+
+% make sure RGB are clean and preallocate lookups
+COL.colsSatur = nan(nSat,  nHue, 3);
+COL.colsElev  = nan(nElev, nHue, 3);
+
+for k = 1:numel(hueID)
+    h   = hueID(k);
+    sVal = satID(k);
+    eVal = elevID(k);
+
+    if ~isfinite(h) || h < 1 || h > nHue
+        continue;
+    end
+
+    % map satID/elevID values to index in satVals/elevVals
+    sIdx = find(satVals == sVal, 1);
+    eIdx = find(elevVals == eVal, 1);
+
+    if ~isempty(sIdx)
+        COL.colsSatur(sIdx, h, :) = rgbAll(k,:);
+    end
+    if ~isempty(eIdx)
+        COL.colsElev(eIdx, h, :) = rgbAll(k,:);
+    end
+end
+
+% load DKL CSV 
+dklFile = fullfile(config.paths.code, 'dkl.csv');
+
+if ~isfile(dklFile)
+    error('Could not find dkl.csv at %s', dklFile);
+end
+
+A = readmatrix(dklFile);
+if size(A,2) < 3
+    error('dkl.csv must have at least 3 numeric columns, found %d.', size(A,2));
+end
+
+DKL = A(:,1:3);
+
+% sanity check row counts
+nProbes = size(COL.probeCols,1);
+if size(DKL,1) ~= nProbes
+    error('dkl.csv row count (%d) does not match ProbeCols (%d).', ...
+          size(DKL,1), nProbes);
+end
+
+% row-wise DKL for master-row indexing
+COL.dklRows = DKL;   % <-- this is what TrialIndex + index_to_dkl will use
+
+% build DKL lookup by saturation × hue (for DKL-plane utilities)
+COL.dkl = nan(nSat, nHue, 3);
+for k = 1:numel(hueID)
+    h   = hueID(k);
+    sVal = satID(k);
+
+    if ~isfinite(h) || h < 1 || h > nHue
+        continue;
+    end
+
+    sIdx = find(satVals == sVal, 1);
+    if ~isempty(sIdx)
+        COL.dkl(sIdx, h, :) = DKL(k,:);
+    end
+end
+
+% load LMS CSV 
+lmsFile = fullfile(config.paths.code, 'lms.csv');
+
+LMS = [];
+
+if isfile(lmsFile)
+    try
+        A = readmatrix(lmsFile);
+        if size(A,2) < 3
+            warning('lms.csv must have at least 3 numeric columns, found %d. LMS will be unavailable.', size(A,2));
+        else
+            LMS = A(:,1:3);
+        end
+    catch ME
+        warning('Failed to read lms.csv at %s: %s. LMS will be unavailable.', ...
+                lmsFile, ME.message);
+    end
+else
+    warning('Could not find lms.csv at %s. LMS will be unavailable.', lmsFile);
+end
+
+if ~isempty(LMS)
+    if size(LMS,1) ~= nProbes
+        warning('lms.csv row count (%d) does not match ProbeCols (%d).', ...
+                size(LMS,1), nProbes);
+    end
+
+    COL.lms = LMS;
+
+    L     = LMS(:,1);
+    M     = LMS(:,2);
+    Scone = LMS(:,3);
+
+    denom = L + M;
+    denom(denom == 0) = NaN;
+
+    COL.lmsCC = [L./denom, M./denom, Scone./denom]; %normalized lms 
+end
+
+end
+
+function A = sanitize_colors(A) %to clip any values that go below or above 0-255
+    A = double(A);
+    A(~isfinite(A)) = 0;
+    A = min(max(A,0),255);
+end
+% ===== END FILE: load_color_metadata.m =====
+
+% ===== FILE: load_common_config.m =====
+% ===== START =====
+function config = load_common_config()
+% load_common_config
+% shared settings for all wrappers (discprobe, sphere, wachtler)
+
+% --- global identity ---
+% config.monkey = 'Jacomo'; 
+
+% --- paths ---
+config.paths.base      = '/Users/tellezi2/Documents/DiscProbe';
+config.paths.code      = '/Users/tellezi2/Documents/DiscProbeAnalysis';
+config.paths.output    = config.paths.base;
+
+% --- experimental parameters ---
+% spike counting windows
+config.time.winEarly   = [0.00 0.20];
+config.time.winLate    = [0.25 0.40];
+config.time.fullWin    = [0.00 0.40];
+config.time.winForHz   = 0.40;
+
+% color space definitions
+config.space.mode      = 'dkl';
+config.space.zeroHue   = 16; 
+
+% --- data processing defaults ---
+config.trials.forceRebuildIndex = false;
+
+% outlier detection 
+config.qc.removeOutliers = true; 
+
+% --- plotting defaults ---
+config.plot.dpi        = 300;
+config.plot.makePlots  = false; 
+end
+% ===== END FILE: load_common_config.m =====
+
+% ===== FILE: load_config.m =====
+% ===== START =====
+function config = load_config()
+
+config.sphere.defaultSession= 'Jacomo_250513';
+
+
+% what figures do we want to do?
+% skip tests/figures by setting false
+% !!! if you want to drop outliers you have to set these two to true
+config.do.boxPlots         = true;
+config.do.dropOutliers     = true;
+
+%discprobe "legacy" (the original set of analyses i did)
+config.do.tuningFigure     = true; %felix's fig
+config.do.rasterCanonical  = true; %raster in rainbow
+config.do.rasterByMean     = true; %raster by mean
+config.do.permutationTest  = true; %cv permutation test
+config.do.spikeAccounting  = true; %cosine fit
+config.do.rayleigh         = true; %raylegih
+config.do.fourier          = true; % fft
+config.do.fourierFig       = true; % to make the 2x2 diagnostic fig
+config.do.dklSuite         = true; %polar plots and dome
+config.do.swatches         = true; %pantenes
+
+%vss
+config.do.peakModel        = true; %fit first and second harmonic
+
+%stas
+config.do.stas             = false;
+
+config.plot.makePlots = false;
+
+
+% Fourier params
+config.fourier.maxHarmonics = 8;
+config.fourier.useHann      = false;
+config.fourier.detrend      = true;
+
+% spike window
+config.time.winEarly  = [0.00 0.20];
+config.time.winLate   = [0.25 0.40];
+config.time.fullWin   = [0.00 0.40];
+config.time.winForHz  = 0.40;
+
+% saturation IDs 
+config.saturations = [0.33 0.66 1];
+
+% output resolution
+config.fig.pngDpi = 300;
+
+% paths 
+config.paths.base      = '/Users/tellezi2/Documents/DiscProbe';
+config.paths.code      = '/Users/tellezi2/Documents/DiscProbeAnalysis';
+config.paths.output    = config.paths.base;
+
+
+config.trials.forceRebuildIndex = true;
+
+
+%name ( for filename matching, it needs to be the same) 
+% config.monkey = 'Jacomo'; 
+
+%alpha harmonic
+config.tuning.alphaHarmonic= 0.05;
+
+% DKL mode or index mode 
+config.space.mode = 'dkl';     % or 'index'
+config.space.zeroHue = 16;     % which hue sits at 0°
+
+% permutation test settings 
+config.pt.nPerm = 1000;
+config.pt.alpha = 0.05;
+config.pt.seed  = 2025;
+
+% legacy / DiscProbe-v1 style settings
+config.legacy.useLegacySats = true;
+config.legacy.sats          = [0.33 0.66 1];   % the three main ones
+config.legacy.satTol        = 1e-3;            % tolerance for matching
+
+%vss
+config.do.saveVssUnitMats  = true;   % turn off per-unit MATs if you want
+config.do.buildVssKeep     = true;   % let build_all_keep_vss own ALL_keep_vss.csv
+end
+% ===== END FILE: load_config.m =====
+
+% ===== FILE: load_discprobe_config.m =====
+% ===== START =====
+function config = load_discprobe_config()
+% config specifically for run_discprobe_analysis.m
+
+% inherit common settings
+config = load_common_config();
+
+% --- analysis flags ---
+config.do.tuningFigure     = true;  % felix's fig
+config.do.rasterCanonical  = true;  % rainbow raster
+config.do.rasterByMean     = false; 
+config.do.spikeAccounting  = true;  % cosine fit viz
+config.do.rayleigh         = true;  % rayleigh viz
+config.do.boxPlots         = true;
+config.do.fourierFig       = true;  
+config.do.dklSuite         = true;  % polar plots
+
+% --- statistics settings ---
+config.do.permutationTest  = true;
+config.do.fourier          = true;
+config.do.peakModel        = true; 
+
+% --- algorithm parameters ---
+% fourier
+config.fourier.maxHarmonics = 8;
+config.fourier.useHann      = false;
+config.fourier.detrend      = true;
+
+% permutation test
+config.pt.nPerm = 1000;
+config.pt.alpha = 0.05;
+config.pt.seed  = 2025;
+
+% tuning fit
+config.tuning.alphaHarmonic = 0.05;
+
+% --- legacy support ---
+config.legacy.useLegacySats = true;
+config.legacy.sats          = [0.33 0.66 1];
+end
+% ===== END FILE: load_discprobe_config.m =====
+
+% ===== FILE: load_sphere_config.m =====
+% ===== START =====
+function config = load_sphere_config()
+% config specifically for sphere_slicer.m
+
+% inherit common settings
+config = load_common_config();
+
+% --- slicer specifics ---
+config.sphere.defaultSession = 'Jacomo_250513';
+
+% minimum trials to consider a slice valid
+config.trials.minTrialsSlice = 10;
+
+% --- overrides ---
+% slicer generates many plots, enforce silence
+config.plot.makePlots = false; 
+
+% force outlier removal 
+config.qc.removeOutliers = true;
+end
+% ===== END FILE: load_sphere_config.m =====
+
+% ===== FILE: load_wachtler_config.m =====
+% ===== START =====
+function config = load_wachtler_config()
+% config specifically for run_wachtler_analysis.m
+
+% inherit common settings
+config = load_common_config();
+
+% --- wachtler specifics ---
+config.wachtler.fitGaussian = true;
+config.wachtler.fitDog      = false; 
+
+% specific saturations for fitting
+config.wachtler.satsToFit   = [0.33 0.66 1.0]; 
+end
+% ===== END FILE: load_wachtler_config.m =====
+
+% ===== FILE: normalize_dates.m =====
+% ===== START =====
+function dates = normalize_dates(D)
+% Normalize various date input formats into a cellstr of 'YYMMDD' char rows.
+
+% single char, like '250513'
+if ischar(D)
+    dates = {char(D)};
+    return;
+end
+
+% string or string array
+if isstring(D)
+    if isscalar(D)
+        dates = {char(D)};
+    else
+        dates = cellstr(D);
+    end
+    return;
+end
+
+% cell array of anything string-like
+if iscell(D)
+    % convert each element to char
+    dates = cellfun(@char, D, 'UniformOutput', false);
+    return;
+end
+
+% numeric or other weird types – try to be forgiving
+if isnumeric(D)
+    % assume rows or elements are datenum-like or YYMMDD-ish, convert via num2str
+    D = num2cell(D);
+    dates = cellfun(@(x) char(string(x)), D, 'UniformOutput', false);
+    return;
+end
+
+% fallback
+dates = {char(string(D))};
+
+end
+% ===== END FILE: normalize_dates.m =====
+

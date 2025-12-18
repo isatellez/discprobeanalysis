@@ -1,225 +1,186 @@
 function plot_dkl_suite(U, stats, COL, config, outDir)
+% PLOT_DKL_SUITE - 3D/2D visualization of tuning in DKL space.
+% Compatible with sphere_slicer (Robust Lookup + Flat Saving).
 
-if U.nTrials == 0
-    return;
-end
+    if U.nTrials == 0
+        return;
+    end
+    
+    % --- CONFIG ---
+    makePlots = true;
+    if isfield(config,'plot') && isfield(config.plot,'makePlots')
+        makePlots = logical(config.plot.makePlots);
+    end
+    figVis = 'on';
+    if ~makePlots, figVis = 'off'; end
 
-if ~isfield(COL,'dklSatur') || isempty(COL.dklSatur)
-    % need DKL per sat×hue from color metadata
-    return;
-end
+    pngDpi = 300;
+    if isfield(config,'plot') && isfield(config.plot,'dpi')
+        pngDpi = config.plot.dpi;
+    end
+    
+    doSaveFig = true;
+    if isfield(config, 'plot') && isfield(config.plot, 'saveFigs')
+        doSaveFig = config.plot.saveFigs;
+    end
 
-dkl_satur2  = COL.dklSatur;   % nSat×nHue×3, legacy style
-cols_satur2 = COL.colsSatur;  % nSat×nHue×3 RGB
+    % --- PATHS ---
+    dateStr  = char(string(U.dateStr));
+    unitType = char(string(U.unitType));
+    unitID   = U.unitID;
 
-nSat_meta = size(dkl_satur2,1);
-nHue_meta = size(dkl_satur2,2);
+    Upaths  = get_unit_paths(config, dateStr, unitType, unitID);
+    unitDir = Upaths.figures;
+    if ~exist(unitDir,'dir'), mkdir(unitDir); end
 
-% basic IDs from trials
-hueID = U.trials.hueID;
-satID = U.trials.satID;
+    % Session Dir (Smart Flat Saving)
+    if nargin < 5 || isempty(outDir), outDir = ''; end
+    sessionDir = '';
+    if ~isempty(outDir)
+        useSub = true;
+        if isfield(config, 'plot') && isfield(config.plot, 'suppressSubfolders') && config.plot.suppressSubfolders
+            useSub = false;
+        end
+        if useSub
+            sessionDir = fullfile(outDir, 'dkl_suite');
+        else
+            sessionDir = outDir; 
+        end
+        if ~exist(sessionDir,'dir'), mkdir(sessionDir); end
+    end
 
-saturIDs = unique(satID(~isnan(satID)));
-saturIDs = saturIDs(:).';
-nS       = numel(saturIDs);
+    % Global Dir
+    globalDir = '';
+    if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
+            && ~isempty(config.paths.globalDiscProbeFigRoot)
+        globalDir = fullfile(config.paths.globalDiscProbeFigRoot, 'dkl_suite');
+        if ~exist(globalDir,'dir'), mkdir(globalDir); end
+    end
 
-% map trial sats into 1..nSat indices
-[~, satIdx_u] = ismember(satID, saturIDs);
-hueIdx_u      = hueID;
+    % --- DATA AGGREGATION ---
+    win = U.winEarly;
+    dur = diff(win);
+    
+    nTr = numel(U.spk);
+    rates = nan(nTr,1);
+    for tt = 1:nTr
+        spks = U.spk{tt};
+        if isempty(spks)
+            rates(tt) = 0;
+        else
+            spks = spks(spks >= win(1) & spks < win(2));
+            rates(tt) = numel(spks) / dur;
+        end
+    end
+    
+    hueID = U.trials.hueID; satID = U.trials.satID; elevID = U.trials.elevID;
+    
+    uH = unique(hueID(~isnan(hueID)));
+    uS = unique(satID(~isnan(satID)));
+    uE = unique(elevID(~isnan(elevID)));
+    if isempty(uE), defE = 0; else, defE = mode(uE); end
 
-% early window in Hz
-win = U.winEarly;
-dur = diff(win);
+    X = []; Y = []; Z = []; R = []; C = [];
+    r_per_hue = zeros(numel(uH), 1); 
+    
+    for hi = 1:numel(uH)
+        hVal = uH(hi);
+        hueRates = [];
+        for si = 1:numel(uS)
+            sVal = uS(si);
+            mask = (hueID == hVal) & (satID == sVal);
+            if nnz(mask) == 0, continue; end
+            
+            meanR = mean(rates(mask), 'omitnan');
+            hueRates = [hueRates; meanR]; %#ok<AGROW>
+            
+            % Robust Lookup
+            [dklCoords, rgbColor] = get_coords_from_meta(COL, hVal, sVal, defE);
+            if all(isnan(dklCoords)), continue; end
+            
+            X = [X; dklCoords(1)]; %#ok<AGROW>
+            Y = [Y; dklCoords(2)]; %#ok<AGROW>
+            Z = [Z; dklCoords(3)]; %#ok<AGROW>
+            R = [R; meanR];        %#ok<AGROW>
+            C = [C; rgbColor];     %#ok<AGROW>
+        end
+        if ~isempty(hueRates), r_per_hue(hi) = mean(hueRates); end
+    end
+    
+    if isempty(R), return; end
+    C = min(max(C,0),1);
+    
+    % --- PROJECTION ---
+    coords = [X, Y, Z];
+    stds   = std(coords, 0, 1);
+    [~, minDim] = min(stds); 
+    dims = setdiff(1:3, minDim);
+    ixX = dims(1); ixY = dims(2);
+    XY = coords(:, [ixX, ixY]);
 
-nTr = numel(U.spk);
-spk_early_hz = nan(nTr,1);
-for tt = 1:nTr
-    spks = U.spk{tt};
-    if isempty(spks)
-        spk_early_hz(tt) = 0;
+    % --- PLOTTING ---
+    f = figure('Color','w','Visible',figVis,'Name','DKL suite');
+    f.Units = 'normalized'; f.Position = [0.1 0.1 0.75 0.7];
+    tlo = tiledlayout(f,1,2,'TileSpacing','compact','Padding','compact');
+
+    % 3D Bars
+    ax3d = nexttile(tlo,1);
+    hold(ax3d,'on'); grid(ax3d,'on'); axis(ax3d,'equal');
+    rPos = max(R,0); maxR = max(rPos); if maxR <= 0, rPos(:) = 0; end
+    baseRadius = 0.05 * (max(XY(:)) - min(XY(:)));
+    if baseRadius == 0, baseRadius = 0.05; end
+    
+    for k = 1:numel(rPos)
+        if rPos(k) <= 0, continue; end
+        x0 = XY(k,1); y0 = XY(k,2); z0 = 0; h = rPos(k); w = baseRadius;
+        xv = [x0-w x0+w x0+w x0-w]; yv = [y0-w y0-w y0+w y0+w];
+        zv = [z0   z0   z0   z0];   zt = zv + h;
+        fc = C(k,:);
+        patch(ax3d, xv, yv, zt, fc, 'FaceAlpha',0.9, 'EdgeColor','none');
+    end
+    xlabel(ax3d, sprintf('DKL Axis %d', ixX)); ylabel(ax3d, sprintf('DKL Axis %d', ixY));
+    zlabel(ax3d, 'Rate (Hz)'); title(ax3d, 'Response in DKL Plane'); view(ax3d, [40 25]);
+
+    % 2D Summary
+    ax2d = nexttile(tlo,2); hold(ax2d,'on'); grid(ax2d,'on');
+    plot(ax2d, 1:numel(uH), r_per_hue, 'o-', 'LineWidth', 1.5, 'Color', 'k');
+    xlim(ax2d, [0.5 numel(uH)+0.5]);
+    xlabel(ax2d, 'Hue Index'); ylabel(ax2d, 'Mean Rate (Hz)'); title(ax2d, 'Marginal Hue Tuning');
+
+    % Title Handling (Replaced dash with standard hyphen)
+    if isfield(U,'exptName')
+        ttl = sprintf('%s | Unit %d (%s) - DKL suite', string(U.exptName), U.unitID, U.unitType);
     else
-        spks = spks(spks >= win(1) & spks < win(2));
-        spk_early_hz(tt) = numel(spks) / dur;
+        ttl = sprintf('%s | Unit %d (%s) - DKL suite', string(U.dateStr), U.unitID, U.unitType);
     end
-end
+    sgtitle(f, ttl, 'Interpreter','none');
 
-% mean response per (sat,hue) like resp_by_sh in the script
-R = NaN(nS, nHue_meta);
-for si = 1:nS
-    for h = 1:nHue_meta
-        sel = (satIdx_u == si) & (hueIdx_u == h);
-        R(si,h) = mean(spk_early_hz(sel), 'omitnan');
+    % --- SAVING ---
+    fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
+    exportgraphics(f, fullfile(unitDir, sprintf('DKL_suite_%s.png', fileTag)), 'Resolution', pngDpi);
+    if doSaveFig, savefig(f, fullfile(unitDir, sprintf('DKL_suite_%s.fig', fileTag))); end
+    
+    if ~isempty(sessionDir)
+        exportgraphics(f, fullfile(sessionDir, sprintf('DKL_suite_%s.png', fileTag)), 'Resolution', pngDpi);
+        if doSaveFig, savefig(f, fullfile(sessionDir, sprintf('DKL_suite_%s.fig', fileTag))); end
     end
-end
-
-% if metadata has more sats than data, trim; if fewer, cap
-if nS ~= nSat_meta
-    m = min(nS, nSat_meta);
-    R           = R(1:m,:);
-    saturIDs    = saturIDs(1:m);
-    dkl_satur2  = dkl_satur2(1:m,:,:);
-    cols_satur2 = cols_satur2(1:m,:,:);
-    nS          = m;
-    nSat_meta   = m;
-end
-
-nHue = nHue_meta;
-
-% detect "L+M" axis as lowest variance across hue
-D = reshape(dkl_satur2(:,1:nHue,:), [], 3);   % (nSat*nHue)×3
-score = std(D,0,1) + 0.1*mean(abs(D),1);
-[~, idxLum] = min(score);
-idxCh = setdiff(1:3, idxLum);
-ixRG  = idxCh(1);
-ixS   = idxCh(2);
-
-% isoluminant plane coords per (sat,hue)
-XY = reshape(dkl_satur2(:,:,[ixRG ixS]), [], 2);   % (nSat*nHue)×2
-
-% colors for each bar
-C = double(reshape(cols_satur2, [], 3));
-if isempty(C) || size(C,2) ~= 3
-    C = repmat([0.5 0.5 0.5], size(XY,1), 1);
-end
-if max(C(:)) > 1
-    C = C / 255;
-end
-C(~isfinite(C)) = 0;
-C = min(max(C,0),1);
-
-% flatten response
-r = reshape(R, [], 1);
-
-% mask out bad points
-bad = any(~isfinite(XY),2) | ~isfinite(r);
-XY(bad,:) = [];
-C(bad,:)  = [];
-r(bad)    = [];
-
-if isempty(XY) || isempty(r)
-    return;
-end
-
-% mean per hue in plane, for the polar-ish summary
-XY_all = reshape(dkl_satur2(:,:,[ixRG ixS]), [], 2);
-XY_all = reshape(XY_all, [nSat_meta*nHue, 2]);
-R_all  = reshape(R, [], 1);
-good   = all(isfinite(XY_all),2) & isfinite(R_all);
-XY_all = XY_all(good,:);
-R_all  = R_all(good);
-
-if isempty(XY_all)
-    XYmean = nan(nHue,2);
-else
-    XYmean = nan(nHue,2);
-    for h = 1:nHue
-        rows = ((0:nSat_meta-1)*nHue) + h;
-        rows = rows(rows <= size(XY_all,1));
-        XYmean(h,:) = nanmean(XY_all(rows,:),1);
+    
+    if ~isempty(globalDir)
+        exportgraphics(f, fullfile(globalDir, sprintf('DKL_suite_%s.png', fileTag)), 'Resolution', pngDpi);
+        if doSaveFig, savefig(f, fullfile(globalDir, sprintf('DKL_suite_%s.fig', fileTag))); end
     end
+    
+    if ~makePlots, close(f); end
 end
 
-th     = mod(atan2(XYmean(:,2), XYmean(:,1)), 2*pi);
-r_hue  = max(0, nanmean(R,1).');
-[thS, ord] = sort(th);
-rS         = r_hue(ord);
-
-% plotting flags
-makePlots = true;
-if isfield(config,'plot') && isfield(config.plot,'makePlots')
-    makePlots = logical(config.plot.makePlots);
-end
-figVis = 'on';
-if ~makePlots
-    figVis = 'off';
-end
-
-unitDir = fullfile(outDir, sprintf('%s_%d', U.unitType, U.unitID));
-if ~exist(unitDir,'dir'), mkdir(unitDir); end
-
-f = figure('Color','w','Visible',figVis,'Name','DKL suite');
-f.Units    = 'normalized';
-f.Position = [0.1 0.1 0.75 0.7];
-
-tlo = tiledlayout(f,1,2,'TileSpacing','compact','Padding','compact');
-
-% 3D bars in DKL chromatic plane
-ax3d = nexttile(tlo,1);
-hold(ax3d,'on'); grid(ax3d,'on'); axis(ax3d,'equal');
-
-% scale radius to something reasonable
-rPos = max(r,0);
-maxR = max(rPos);
-if maxR <= 0
-    rPos(:) = 0;
-end
-
-% bar "footprint" radius relative to max response
-baseRadius = 0.06;
-for k = 1:numel(rPos)
-    if rPos(k) <= 0, continue; end
-    x0 = XY(k,1);
-    y0 = XY(k,2);
-    z0 = 0;
-    h  = rPos(k);
-
-    w  = baseRadius;
-    xv = [x0-w x0+w x0+w x0-w];
-    yv = [y0-w y0-w y0+w y0+w];
-    zv = [z0   z0   z0   z0];
-    zt = zv + h;
-
-    fc = C(k,:);
-    patch(ax3d, xv, yv, zt, fc, 'FaceAlpha',0.9, 'EdgeColor','none');
-    patch(ax3d, xv, yv, zv, fc*0.6, 'FaceAlpha',0.7, 'EdgeColor','none');
-end
-
-xlabel(ax3d,'DKL chromatic axis 1');
-ylabel(ax3d,'DKL chromatic axis 2');
-zlabel(ax3d,'Rate (Hz)');
-title(ax3d,'Mean response per (sat,hue) in DKL plane');
-
-view(ax3d, [40 25]);
-
-% polar-ish summary of hue tuning in that plane
-ax2d = nexttile(tlo,2);
-hold(ax2d,'on'); grid(ax2d,'on');
-
-if all(isfinite(thS)) && any(rS>0)
-    polaraxes(ax2d.Parent); delete(ax2d); % ensure polar axes
-    ax2d = polaraxes('Parent',f);
-    ax2d.Layout.Tile = 2;
-    polarplot(ax2d, thS, rS, 'o-','LineWidth',1.5);
-    title(ax2d,'Mean rate vs hue angle in DKL plane');
-else
-    % fallback if angles are bad
-    plot(ax2d, 1:nHue, r_hue, 'o-','LineWidth',1.5);
-    xlim(ax2d,[0.5 nHue+0.5]);
-    xlabel(ax2d,'Hue index');
-    ylabel(ax2d,'Mean rate (Hz)');
-    title(ax2d,'Mean rate per hue');
-end
-
-% title
-if isfield(U,'exptName')
-    ttl = sprintf('%s | Unit %d (%s) — DKL suite', ...
-        string(U.exptName), U.unitID, U.unitType);
-else
-    ttl = sprintf('%s | Unit %d (%s) — DKL suite', ...
-        string(U.dateStr), U.unitID, U.unitType);
-end
-sgtitle(f, ttl, 'Interpreter','none');
-
-% save
-fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
-pngName = fullfile(unitDir, sprintf('DKL_suite_%s.png', fileTag));
-figName = fullfile(unitDir, sprintf('DKL_suite_%s.fig', fileTag));
-
-exportgraphics(f, pngName, 'Resolution', 300);
-savefig(f, figName);
-
-if ~makePlots
-    close(f);
-end
-
+% --- HELPER ---
+function [dkl, rgb] = get_coords_from_meta(COL, h, s, e)
+    dkl = [NaN NaN NaN]; rgb = [0.5 0.5 0.5];
+    if ~isfield(COL, 'probeIDs') || ~isfield(COL, 'dklRows'), return; end
+    tol = 1e-4;
+    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
+    if ~isempty(idx)
+        dkl = double(COL.dklRows(idx, :));
+        if isfield(COL, 'probeCols'), rawC = double(COL.probeCols(idx, :)); if max(rawC)>1, rawC=rawC/255; end; rgb=rawC; end
+    end
 end

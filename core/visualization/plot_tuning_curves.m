@@ -6,7 +6,7 @@ if ~isfield(stats, 'hueMeans') || isempty(stats.hueMeans)
     return;
 end
 
-hm = stats.hueMeans;
+hm   = stats.hueMeans;
 hues = hm.hues;
 y    = hm.rate_mean;
 e    = hm.rate_sem;
@@ -15,19 +15,58 @@ if isempty(hues) || all(~isfinite(y))
     return;
 end
 
+% plotting flags
 makePlots = true;
 if isfield(config, 'plot') && isfield(config.plot, 'makePlots')
     makePlots = logical(config.plot.makePlots);
 end
-figVis = iff(makePlots,'on','off');
+figVis = 'on';
+if ~makePlots
+    figVis = 'off';
+end
 
 pngDpi = 300;
 if isfield(config, 'plot') && isfield(config.plot, 'dpi')
     pngDpi = config.plot.dpi;
 end
 
-unitDir = fullfile(outDir, sprintf('%s_%d', U.unitType, U.unitID));
-if ~exist(unitDir,'dir'), mkdir(unitDir); end
+% ---------- paths: per-unit, per-session, global ----------
+
+dateStr  = char(string(U.dateStr));
+unitType = char(string(U.unitType));
+unitID   = U.unitID;
+
+% per-unit dir: units/<unit>/figures (flat)
+Upaths  = get_unit_paths(config, dateStr, unitType, unitID);
+unitDir = Upaths.figures;
+if ~exist(unitDir,'dir')
+    mkdir(unitDir);
+end
+
+
+% per-session dir: <date>/figs/discprobe/tuning
+if nargin < 5 || isempty(outDir)
+    outDir = '';
+end
+sessionDir = '';
+if ~isempty(outDir)
+    sessionDir = fullfile(outDir, 'tuning');
+    if ~exist(sessionDir,'dir')
+        mkdir(sessionDir);
+    end
+end
+
+% global dir: output/figs/discprobe/tuning
+globalDir = '';
+if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
+        && ~isempty(config.paths.globalDiscProbeFigRoot)
+    globalDir = fullfile(config.paths.globalDiscProbeFigRoot, 'tuning');
+    if ~exist(globalDir,'dir')
+        mkdir(globalDir);
+    end
+end
+
+% ---------- figure + plots ----------
 
 f = figure('Visible',figVis,'Color','w');
 t = tiledlayout(f, 2, 1, 'TileSpacing','compact', 'Padding','compact');
@@ -59,13 +98,20 @@ nH = numel(hues);
 for i = 1:nH
     h = hues(i);
     c = [0.5 0.5 0.5];
-    if isfield(COL, 'colsSatur')
+
+    if isfield(COL, 'colsSatur') && ~isempty(COL.colsSatur)
         satIdx = size(COL.colsSatur,1); % highest saturation row
         if h >= 1 && h <= size(COL.colsSatur,2)
             rgb = squeeze(COL.colsSatur(satIdx, h, :));
-            c = double(rgb(:)') ./ 255;
+            rgb = double(rgb(:)');
+            if max(rgb) > 1
+                rgb = rgb / 255;
+            end
+            rgb(~isfinite(rgb)) = 0;
+            c = rgb;
         end
     end
+
     patch(ax2, [i-0.4 i+0.4 i+0.4 i-0.4], [0 0 1 1], c, ...
         'EdgeColor','none');
 end
@@ -76,19 +122,35 @@ set(ax2,'XTick',hues,'YTick',[]);
 xlabel(ax2,'Hue index');
 title(ax2, 'Screen colors (max sat)');
 
-fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
-pngName = fullfile(unitDir, sprintf('TuningCurve_%s.png', fileTag));
-figName = fullfile(unitDir, sprintf('TuningCurve_%s.fig', fileTag));
+% ---------- save in all three locations ----------
 
-exportgraphics(f, pngName, 'Resolution', pngDpi);
-savefig(f, figName);
+fileTag  = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
+baseName = sprintf('TuningCurve_%s', fileTag);
+
+% per-unit
+png_unit = fullfile(unitDir, [baseName '.png']);
+fig_unit = fullfile(unitDir, [baseName '.fig']);
+exportgraphics(f, png_unit, 'Resolution', pngDpi);
+savefig(f, fig_unit);
+
+% per-session
+if ~isempty(sessionDir)
+    png_sess = fullfile(sessionDir, [baseName '.png']);
+    fig_sess = fullfile(sessionDir, [baseName '.fig']);
+    exportgraphics(f, png_sess, 'Resolution', pngDpi);
+    savefig(f, fig_sess);
+end
+
+% global
+if ~isempty(globalDir)
+    png_glob = fullfile(globalDir, [baseName '.png']);
+    fig_glob = fullfile(globalDir, [baseName '.fig']);
+    exportgraphics(f, png_glob, 'Resolution', pngDpi);
+    savefig(f, fig_glob);
+end
 
 if ~makePlots
     close(f);
 end
 
-end
-
-function out = iff(cond, a, b)
-    if cond, out = a; else, out = b; end
 end

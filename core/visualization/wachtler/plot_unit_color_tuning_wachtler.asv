@@ -1,0 +1,141 @@
+function H = plot_unit_color_tuning_wachtler(U, unitTuning, COL, config)
+% Polar tuning plot + circular-normal fit for one unit.
+
+thetaDeg = unitTuning.thetaDeg;
+satIDs   = unitTuning.saturIDs;
+meanRate = unitTuning.meanRate;
+fit      = [];
+
+if isfield(unitTuning, 'fit')
+    fit = unitTuning.fit;
+end
+
+nH = numel(thetaDeg);
+if nH == 0 || isempty(meanRate)
+    H.fig = [];
+    H.ax  = [];
+    return;
+end
+
+% choose which saturation index we actually plot (same logic as compute_*)
+useSats = [];
+if isfield(config, 'tuning') && isfield(config.tuning, 'useSaturIDs') ...
+        && ~isempty(config.tuning.useSaturIDs)
+    useSats = config.tuning.useSaturIDs(:).';
+end
+
+satTol = 1e-3;
+if isfield(config, 'legacy') && isfield(config.legacy, 'satTol')
+    satTol = config.legacy.satTol;
+end
+
+if isempty(satIDs)
+    bestSatIdx = 1;
+else
+    fitMask = true(size(satIDs));
+    if ~isempty(useSats)
+        fitMask = false(size(satIDs));
+        for s = useSats
+            fitMask = fitMask | abs(satIDs - s) < satTol;
+        end
+    end
+    satIdx = find(fitMask);
+    if isempty(satIdx)
+        satIdx = 1:numel(satIDs);
+    end
+    [~, kLocal] = max(satIDs(satIdx));
+    bestSatIdx = satIdx(kLocal);
+end
+
+bestSatIdx = max(1, min(bestSatIdx, size(meanRate,2)));
+
+resp = meanRate(:, bestSatIdx);
+if all(~isfinite(resp)) || all(resp == 0 | isnan(resp))
+    respNorm = zeros(size(resp));
+else
+    resp(resp < 0) = 0;
+    m = max(resp);
+    if m > 0
+        respNorm = resp ./ m;
+    else
+        respNorm = zeros(size(resp));
+    end
+end
+
+thetaRad = deg2rad(thetaDeg);
+
+H.fig = figure('Color','w');
+H.ax  = polaraxes(H.fig);
+
+ax = H.ax;
+hold(ax, 'on');
+
+ax.ThetaZeroLocation = 'top';
+ax.ThetaDir          = 'clockwise';
+rlim(ax, [0 1]);
+rticks(ax, 0:0.25:1);
+
+% colors for each hue from COL.colsSatur at the same sat index
+RGB = repmat([0.5 0.5 0.5], nH, 1);
+if isfield(COL, 'colsSatur') && ~isempty(COL.colsSatur)
+    sz = size(COL.colsSatur);        % [nSat x nHue x 3]
+    nSatMeta = sz(1);
+    nHueMeta = sz(2);
+    satRow   = min(bestSatIdx, nSatMeta);
+    for k = 1:nH
+        hID = unitTuning.thetaID(k);
+        if isfinite(hID) && hID >= 1 && hID <= nHueMeta
+            rgb = squeeze(COL.colsSatur(satRow, hID, :));
+            rgb = double(rgb(:).');
+            if max(rgb) > 1
+                rgb = rgb ./ 255;
+            end
+            rgb(~isfinite(rgb)) = 0;
+            RGB(k,:) = min(max(rgb, 0), 1);
+        end
+    end
+end
+
+for k = 1:nH
+    r = respNorm(k);
+    if ~isfinite(r) || r <= 0
+        continue;
+    end
+    polarplot(ax, [thetaRad(k) thetaRad(k)], [0 r], '-', ...
+        'LineWidth', 2, 'Color', RGB(k,:));
+end
+
+% overlay circular-normal fit if available
+if ~isempty(fit)
+    phi = linspace(0, 2*pi, 360).';
+    fitRate = fit.A0 + fit.A * exp((cos(phi - deg2rad(fit.phi0_deg)) - 1) / (fit.sigma.^2));
+    fitRate(fitRate < 0) = 0;
+    if max(fitRate) > 0
+        fitRate = fitRate ./ max(fitRate);
+    end
+    polarplot(ax, phi, fitRate, 'k-', 'LineWidth', 2);
+end
+
+al = NaN;
+if ~isempty(satIDs) && bestSatIdx <= numel(satIDs)
+    bestSatVal = satIDs(bestSatIdx);
+end
+
+prefStr = 'pref=?°';
+fwhmStr = 'FWHM=?°';
+if ~isempty(fit)
+    prefStr = sprintf('pref=%.0f°', fit.phi0_deg);
+    fwhmStr = sprintf('FWHM=%.0f°', fit.fwhm_deg);
+end
+
+if isfinite(bestSatVal)
+    ttl = sprintf('Unit %d (%s) | sat=%.2f | %s | %s', ...
+        U.unitID, U.unitType, bestSatVal, prefStr, fwhmStr);
+else
+   bestSatV ttl = sprintf('Unit %d (%s) | %s | %s', ...
+        U.unitID, U.unitType, prefStr, fwhmStr);
+end
+
+title(ax, ttl, 'Interpreter', 'none');
+
+end

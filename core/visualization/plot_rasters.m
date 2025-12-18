@@ -9,6 +9,7 @@ if nargin < 6 || isempty(mode)
 end
 mode = string(mode);
 
+% figure visibility
 makePlots = true;
 if isfield(config,'plot') && isfield(config.plot,'makePlots')
     makePlots = logical(config.plot.makePlots);
@@ -23,8 +24,43 @@ if isfield(config,'plot') && isfield(config.plot,'dpi')
     pngDpi = config.plot.dpi;
 end
 
-unitDir = fullfile(outDir, sprintf('%s_%d', U.unitType, U.unitID));
-if ~exist(unitDir,'dir'), mkdir(unitDir); end
+% ---------- paths: per-unit, per-session, global ----------
+
+dateStr  = char(string(U.dateStr));
+unitType = char(string(U.unitType));
+unitID   = U.unitID;
+
+% per-unit dir: units/<unit>/figures (flat, no subfolders)
+Upaths  = get_unit_paths(config, dateStr, unitType, unitID);
+unitDir = Upaths.figures;
+if ~exist(unitDir,'dir')
+    mkdir(unitDir);
+end
+
+
+% per-session dir: <date>/figs/discprobe/rasters
+if nargin < 5 || isempty(outDir)
+    outDir = '';
+end
+sessionDir = '';
+if ~isempty(outDir)
+    sessionDir = fullfile(outDir, 'rasters');
+    if ~exist(sessionDir,'dir')
+        mkdir(sessionDir);
+    end
+end
+
+% global dir: output/figs/discprobe/rasters
+globalDir = '';
+if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
+        && ~isempty(config.paths.globalDiscProbeFigRoot)
+    globalDir = fullfile(config.paths.globalDiscProbeFigRoot, 'rasters');
+    if ~exist(globalDir,'dir')
+        mkdir(globalDir);
+    end
+end
+
+% ---------- data prep ----------
 
 spkcell_u = U.spk(:);
 mrkcell_u = U.mrk(:);
@@ -55,7 +91,7 @@ else
     end
 end
 
-% trial-type grouping variable (like trType_u(:,1) in legacy code)
+% trial-type grouping variable
 if isfield(U.trials,'trialTypeID')
     gid_base = U.trials.trialTypeID(:);
 elseif isfield(U.trials,'trType')
@@ -85,7 +121,7 @@ nTrials_now = numel(spkcell_u);
 nNonzero    = sum(cellfun(@(x) ~isempty(x), spkcell_u));
 nSpikes_tot = sum(cellfun(@numel, spkcell_u));
 
-% unit labels
+% labels
 if strcmpi(U.unitType,'SU')
     unitLabel = sprintf('UnitID %d (SU)', U.unitID);
 else
@@ -99,12 +135,14 @@ else
 end
 
 sessionStamp = string(U.dateStr);
+fileBaseTag  = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
 
-fileBaseTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
+% ---------- plotting modes ----------
 
 switch mode
     case "canonical"
         groupvar = gid_base;
+
         H = DrawRaster(spkcell_u, mrkcell_u, groupvar, rowRGB);
         set(H,'Color','w','Visible',figVis,'Name','Raster — canonical');
 
@@ -117,15 +155,36 @@ switch mode
         end
         title(ttl,'Interpreter','none','FontWeight','bold');
 
-        pngName = fullfile(unitDir, sprintf('Raster_canonical_%s.png', fileBaseTag));
-        figName = fullfile(unitDir, sprintf('Raster_canonical_%s.fig', fileBaseTag));
+        baseName = sprintf('Raster_canonical_%s', fileBaseTag);
 
-        exportgraphics(H, pngName, 'Resolution', pngDpi);
-        savefig(H, figName);
-        if ~makePlots && ishghandle(H), close(H); end
+        % per-unit
+        png_unit = fullfile(unitDir, [baseName '.png']);
+        fig_unit = fullfile(unitDir, [baseName '.fig']);
+        exportgraphics(H, png_unit, 'Resolution', pngDpi);
+        savefig(H, fig_unit);
+
+        % per-session
+        if ~isempty(sessionDir)
+            png_sess = fullfile(sessionDir, [baseName '.png']);
+            fig_sess = fullfile(sessionDir, [baseName '.fig']);
+            exportgraphics(H, png_sess, 'Resolution', pngDpi);
+            savefig(H, fig_sess);
+        end
+
+        % global
+        if ~isempty(globalDir)
+            png_glob = fullfile(globalDir, [baseName '.png']);
+            fig_glob = fullfile(globalDir, [baseName '.fig']);
+            exportgraphics(H, png_glob, 'Resolution', pngDpi);
+            savefig(H, fig_glob);
+        end
+
+        if ~makePlots && ishghandle(H)
+            close(H);
+        end
 
     case "mean"
-        % group by trial type, compute mean early rate per group
+        % group by trial type, sort by mean early rate
         gid = gid_base;
         [ug,~,gix] = unique(gid,'stable');
         m_by_group = accumarray(gix, spk_early_hz, [numel(ug) 1], @mean, NaN);
@@ -154,12 +213,33 @@ switch mode
         end
         title(ttl,'Interpreter','none','FontWeight','bold');
 
-        pngName = fullfile(unitDir, sprintf('Raster_byGroupMean_%s.png', fileBaseTag));
-        figName = fullfile(unitDir, sprintf('Raster_byGroupMean_%s.fig', fileBaseTag));
+        baseName = sprintf('Raster_byGroupMean_%s', fileBaseTag);
 
-        exportgraphics(H2, pngName, 'Resolution', pngDpi);
-        savefig(H2, figName);
-        if ~makePlots && ishghandle(H2), close(H2); end
+        % per-unit
+        png_unit = fullfile(unitDir, [baseName '.png']);
+        fig_unit = fullfile(unitDir, [baseName '.fig']);
+        exportgraphics(H2, png_unit, 'Resolution', pngDpi);
+        savefig(H2, fig_unit);
+
+        % per-session
+        if ~isempty(sessionDir)
+            png_sess = fullfile(sessionDir, [baseName '.png']);
+            fig_sess = fullfile(sessionDir, [baseName '.fig']);
+            exportgraphics(H2, png_sess, 'Resolution', pngDpi);
+            savefig(H2, fig_sess);
+        end
+
+        % global
+        if ~isempty(globalDir)
+            png_glob = fullfile(globalDir, [baseName '.png']);
+            fig_glob = fullfile(globalDir, [baseName '.fig']);
+            exportgraphics(H2, png_glob, 'Resolution', pngDpi);
+            savefig(H2, fig_glob);
+        end
+
+        if ~makePlots && ishghandle(H2)
+            close(H2);
+        end
 
     otherwise
         warning('plot_rasters: unknown mode "%s"', mode);

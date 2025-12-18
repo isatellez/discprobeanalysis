@@ -1,7 +1,5 @@
 function U = detect_outliers(U, config)
-% Mark and drop trial outliers based on early-window firing rates.
-% Based on BOX PLOTS + OUTLIERS + DROP OUTLIERS blocks in
-% Analyze_DiscProbePSTHs_v1figproc.m.
+% mark and drop trial outliers based on early window firing rates.
 
 if ~isfield(U, 'spk') || ~isfield(U, 'trials')
     return;
@@ -11,7 +9,7 @@ hueID = U.trials.hueID;
 satID = U.trials.satID;
 
 win = U.winEarly;
-dur = diff(win);
+dur = diff(win); %duration 
 
 nTr = numel(U.spk);
 rateEarly = nan(nTr,1);
@@ -21,16 +19,15 @@ for tt = 1:nTr
     if isempty(spks)
         rateEarly(tt) = 0;
     else
-        % bug was here: must use & for elementwise AND, not &&
         spks = spks(spks >= win(1) & spks < win(2));
-        rateEarly(tt) = numel(spks) / dur;
+        rateEarly(tt) = numel(spks) / dur; %average spikes
     end
 end
 
-% defaults match the legacy script intent
+% default is tukey 
 useNorm = false;
 method  = 'tukey';   % 'tukey' or 'mad'
-minN    = 5;
+minN    = 5; %min number of spikes in window to do analysis 
 
 if isfield(config, 'boxPlots')
     if isfield(config.boxPlots, 'useNorm')
@@ -44,7 +41,7 @@ if isfield(config, 'boxPlots')
     end
 end
 
-% normalization option
+% normalization of firing rates if normalization was chosen 
 if useNorm
     r = rateEarly;
     r = r - min(r);
@@ -58,10 +55,10 @@ else
     vals = rateEarly;
 end
 
-is_out = false(nTr,1);
+is_out = false(nTr,1); %assume everyone is in at the beginning
 
-satVals = unique(satID(~isnan(satID)));
-hueVals = unique(hueID(~isnan(hueID)));
+satVals = unique(satID(~isnan(satID))); %unique sats
+hueVals = unique(hueID(~isnan(hueID))); %unique hue values
 
 for si = 1:numel(satVals)
     s = satVals(si);
