@@ -1,420 +1,165 @@
-% ===== FILE: DiscProbe_STA_LMSLINv6_DirectFit.m =====
+% ===== FILE: DiscProbe_3D_Coordinate_Regression.m =====
 % ===== START =====
-function DiscProbe_STA_LMSLINv6_DirectFit(DATES)
-% Direct fitting version - fits LMS/DKL models directly to data
-% Uses stimulus-mean responses only (no per-trial fitting)
+function DiscProbe_3D_Coordinate_Regression(DATES)
+% Fits a 3D Poisson GLM to all trials using LMS coordinates.
+% Uses defensive programming to handle inconsistent naming (satID vs satVal).
 
-clc;
-
-rootDir = fileparts(mfilename('fullpath'));
-addpath(genpath(rootDir));
-
-config = load_config();
-MONKEY = config.monkey;
-
-PATHS = struct();
-PATHS.baseDiscProbeLocal = config.paths.base;
-PATHS.baseDiscProbesCode = config.paths.code;
-
-if nargin < 1 || isempty(DATES) || ...
-        (ischar(DATES)   && strcmpi(strtrim(DATES),'all')) || ...
-        (isstring(DATES) && strcmpi(strtrim(DATES),'all'))
-    d = dir(PATHS.baseDiscProbeLocal);
-    isDir  = [d.isdir];
-    names  = {d(isDir).name};
-    names  = names(~ismember(names, {'.','..'}));
-    isDate = cellfun(@(s) numel(s)==6 && all(isstrprop(s,'digit')), names);
-    DATES  = sort(names(isDate));
-end
-if ischar(DATES) || isstring(DATES)
-    DATES = cellstr(DATES);
-end
-
-warning('off','stats:glmfit:IllConditioned');
-warning('off','stats:glmfit:IterationLimit');
-warning('off','MATLAB:rankDeficientMatrix');
-
-timeWin   = [0 0.2];
-saturIDs  = [0.33 0.66 1];
-nSat      = numel(saturIDs);
-N_BOOT_REPS = 1000;
-
-% collect everything across sessions
-allRowsGlobal = [];
-
-% ------------- keep list ----------------
-keepMap = load_keep_map(PATHS.baseDiscProbeLocal);
-
-
-% ------------- color metadata ----------------
-lmsFile = fullfile(PATHS.baseDiscProbesCode,'lms.csv');
-if ~isfile(lmsFile), error('Missing lms.csv at %s', lmsFile); end
-LMS_all = readmatrix(lmsFile);
-
-colsFile = fullfile(PATHS.baseDiscProbesCode, 'DiscProbeColsUpdated.mat');
-if ~isfile(colsFile), error('Missing DiscProbeColsUpdated.mat at %s', colsFile); end
-load(colsFile, 'ProbeCols', 'ProbeColIDs');
-nHue = max(ProbeColIDs(:,1));
-LMS_satur2 = reshape(LMS_all(1:nSat*nHue,1:3), [nSat, nHue, 3]);
-nColorLMS  = size(LMS_satur2,3);
-
-% ------------- loop over sessions ----------------
-for idate = 1:numel(DATES)
-    filedate = DATES{idate};
-    fprintf('\n=== %s: Direct LMS & DKL fitting ===\n', filedate);
-
-    expFile = locate_expTrialsDisc(PATHS, MONKEY, filedate);
-    if ~isfile(expFile)
-        fprintf('  [%s] ExpTrialsDisc file not found, skipping.\n', filedate);
-        continue;
-    end
-    S = load(expFile);
-    ExptTrialsDisc = S.ExptTrialsDisc;
-    ExptInfo       = S.ExptInfo;
-
-    nSU     = ExptInfo.nSU;
-    nMU     = ExptInfo.nMU;
-    nTOT    = nSU + nMU;
-    unitIDs = [ExptInfo.spk_ID_SU; ExptInfo.spk_ID_MU];
-
-    trialMat = fullfile(PATHS.baseDiscProbeLocal, filedate, ...
-        sprintf('%s_TrialIDs_session.mat', filedate));
-    if ~isfile(trialMat)
-        fprintf('  [%s] TrialIDs_session.mat not found, skipping.\n', filedate);
-        continue;
-    end
-    T_trials = load(trialMat,'T_trials');
-    T_trials = T_trials.T_trials;
-    nTrials  = height(T_trials);
-
-    hueIdx = T_trials.hueIdx;
-    satVal = T_trials.satVal;
-    [satIdx, okSat] = ismember(satVal, saturIDs);
-    validStim = okSat & hueIdx >= 1 & hueIdx <= nHue;
-
-    trial_LMS = nan(nTrials, nColorLMS);
-    for t = 1:nTrials
-        if ~validStim(t), continue; end
-        trial_LMS(t,:) = squeeze(LMS_satur2(satIdx(t), hueIdx(t), :));
-    end
-
-    cols = 10:(9+nTOT);
-    spkcell_all = ExptTrialsDisc(:,cols);
-    spkcell_all = cellfun(@(x)x(x>=timeWin(1)&x<timeWin(2)),spkcell_all,'UniformOutput',false);
-    spkcounts_all = cellfun(@numel,spkcell_all);
-
-    outDir = fullfile(PATHS.baseDiscProbeLocal,filedate,'STA_LMSchannels');
-    if ~exist(outDir,'dir'), mkdir(outDir); end
-    allRows = [];
-
-    for cc = 1:nTOT
-        unitType  = iff(cc <= nSU,'SU','MU');
-        unitLabel = sprintf('%s%d',unitType,unitIDs(cc));
-        if ~isempty(keepMap)
-            key = sprintf('%s_%s',filedate,unitLabel);
-            if ~isKey(keepMap,key) || keepMap(key)==0, continue; end
+    clc;
+    rootDir = fileparts(mfilename('fullpath'));
+    addpath(genpath(rootDir));
+    
+    config = load_config();
+    COL    = load_color_metadata(config);
+    
+    % 1. Create the Master Color Mapping with STANDARDIZED names
+    ColorMap = get_standardized_color_table(config);
+    
+    % 2. Handle Dates
+    if nargin < 1 || isempty(DATES), DATES = 'all'; end
+    if ischar(DATES) || isstring(DATES)
+        if strcmpi(DATES, 'all')
+            d = dir(config.paths.base);
+            names = {d([d.isdir]).name};
+            validIdx = cellfun(@(s) ~isempty(regexp(s, '\d{6}', 'once')), names) & ...
+                       ~ismember(names, {'.','..'});
+            DATES = sort(names(validIdx));
+        else
+            DATES = {char(DATES)};
         end
+    end
 
-        phyID = unitIDs(cc);
-        staFileInfo = find_sta_file(PATHS,filedate,unitType,phyID);
-        if isempty(staFileInfo), continue; end
+    timeWin = [0.05 0.20]; 
+    allUnitsResults = [];
+
+    for d = 1:numel(DATES)
+        targetStr = char(DATES{d});
+        sessionFolder = resolve_session_folder(config.paths.base, targetStr);
+        
+        if isempty(sessionFolder)
+            warning('Could not find folder for %s. Skipping.', targetStr);
+            continue;
+        end
+        
+        fprintf('\n=== 3D Regression Analysis: %s ===\n', sessionFolder);
 
         try
-            [w_chan, chanNames_sta] = grand_sta_per_color(staFileInfo.fullpath);
+            S = load_session(sessionFolder, config);
         catch ME
-            fprintf('  [%s] %s: STA load failed: %s\n',filedate,unitLabel,ME.message);
+            fprintf('  Load failed: %s\n', ME.message);
+            continue;
+        end
+        
+        % Generate the Trial Index Table
+        T = make_trial_index_table(S, COL, config);
+        
+        % --- DEFENSIVE RENAMING FOR T ---
+        T = standardize_table_names(T);
+        
+        % Now the join is guaranteed to find 'hueID', 'satVal', and 'elevID'
+        try
+            T_full = join(T, ColorMap, 'Keys', {'hueID','satVal','elevID'});
+        catch ME
+            warning('Join failed for %s. Check variable names: %s', ...
+                sessionFolder, ME.message);
             continue;
         end
 
-        idxL = find(strcmpi(chanNames_sta,'L'),1);
-        idxM = find(strcmpi(chanNames_sta,'M'),1);
-        idxS = find(strcmpi(chanNames_sta,'S'),1);
-        if isempty(idxL)||isempty(idxM)
-            fprintf('  [%s] %s: missing L/M weights.\n',filedate,unitLabel);
-            continue;
-        end
+        for cc = 1:S.nUnits
+            phyID = S.unitIDs(cc);
+            uType = S.unitTypes{cc};
+            unitLabel = sprintf('%s%d', uType, phyID);
 
-        wL = w_chan(idxL); wM = w_chan(idxM);
-        hasS = ~isempty(idxS); if hasS, wS = w_chan(idxS); end
+            % 1. Count spikes
+            y = cellfun(@(x) sum(x >= timeWin(1) & x <= timeWin(2)), S.spk{cc});
+            y = y(:); 
 
-        L_disc_all = trial_LMS(:,1);
-        M_disc_all = trial_LMS(:,2);
-        if hasS, S_disc_all = trial_LMS(:,3); end
-        y_all = spkcounts_all(:,cc);
+            % 2. Predictor Matrix: L, M, S
+            X = [T_full.L, T_full.M, T_full.S];
+            
+            validRows = all(isfinite(X), 2);
+            X_fit = X(validRows, :);
+            y_fit = y(validRows);
 
-        if hasS
-            valid = validStim & isfinite(L_disc_all)&isfinite(M_disc_all)&isfinite(S_disc_all)&isfinite(y_all);
-        else
-            valid = validStim & isfinite(L_disc_all)&isfinite(M_disc_all)&isfinite(y_all);
-        end
-        if nnz(valid)<20, continue; end
+            if numel(y_fit) < 50, continue; end
 
-        y=y_all(valid);
-        L_disc=L_disc_all(valid);
-        M_disc=M_disc_all(valid);
-        if hasS, S_disc=S_disc_all(valid); end
-        stimID = sub2ind([nSat nHue],satIdx(valid),hueIdx(valid));
-        nStim  = nSat*nHue;
-
-        gL=wL*L_disc; gM=wM*M_disc;
-        if hasS
-            gS=wS*S_disc;
-            G_LMS=[gL,gM,gS]; chanNames_LMS={'L','M','S'};
-        else
-            G_LMS=[gL,gM]; chanNames_LMS={'L','M'};
-        end
-
-        [~, bestChan_LMS, ~, ~, ~, ~, LMS_b0, LMS_betas, R2_best_stim_LMS, R2_all_stim_LMS] = ...
-            compute_space_stats_direct(G_LMS, y, stimID, nSat, nHue, chanNames_LMS, N_BOOT_REPS, nStim);
-
-        LMS_bL=NaN; LMS_bM=NaN; LMS_bS=NaN;
-        for ii=1:numel(chanNames_LMS)
-            switch upper(chanNames_LMS{ii})
-                case 'L', LMS_bL=LMS_betas(ii);
-                case 'M', LMS_bM=LMS_betas(ii);
-                case 'S', LMS_bS=LMS_betas(ii);
+            try
+                % Fit Poisson GLM (Log-Link)
+                [b, dev, stats] = glmfit(X_fit, y_fit, 'poisson', 'link', 'log');
+                
+                % Pseudo-R2
+                R2 = 1 - (dev / stats.null_dev);
+                
+                fprintf('  %s | R2: %.3f | Weights: L:%.2f M:%.2f S:%.2f\n', ...
+                    unitLabel, R2, b(2), b(3), b(4));
+                
+                allUnitsResults = [allUnitsResults; struct(...
+                    'session', sessionFolder, 'unit', unitLabel, ...
+                    'R2_3D', R2, 'b0', b(1), 'bL', b(2), 'bM', b(3), 'bS', b(4))]; %#ok<AGROW>
+            catch
+                fprintf('  %s | GLM fit failed.\n', unitLabel);
             end
         end
-
-        bestChan_DKL=''; R2_best_stim_DKL=NaN; R2_all_stim_DKL=NaN;
-        DKL_b0=NaN; DKL_betas=[NaN NaN]; DKL_bLmM=NaN; DKL_bSLpM=NaN;
-        if hasS
-            g_LmM=wL*L_disc-wM*M_disc;
-            g_S_LpM=wS*S_disc-(wL*L_disc+wM*M_disc);
-            G_DKL=[g_LmM,g_S_LpM];
-            chanNames_DKL={'L_minus_M','S_minus_LpM'};
-            [~, bestChan_DKL, ~, ~, ~, ~, DKL_b0, DKL_betas, R2_best_stim_DKL, R2_all_stim_DKL] = ...
-                compute_space_stats_direct(G_DKL, y, stimID, nSat, nHue, chanNames_DKL, N_BOOT_REPS, nStim);
-            for ii=1:numel(chanNames_DKL)
-                switch chanNames_DKL{ii}
-                    case 'L_minus_M', DKL_bLmM=DKL_betas(ii);
-                    case 'S_minus_LpM', DKL_bSLpM=DKL_betas(ii);
-                end
-            end
-        else
-            fprintf('  [%s] %s: no S channel → skipping DKL.\n', filedate, unitLabel);
-        end
-
-        fprintf('  [%s] %s | LMS best=%s R2_best_stim=%.3f R2_all_stim=%.3f | DKL best=%s R2_best_stim=%.3f R2_all_stim=%.3f\n', ...
-            filedate, unitLabel, bestChan_LMS, R2_best_stim_LMS, R2_all_stim_LMS, bestChan_DKL, R2_best_stim_DKL, R2_all_stim_DKL);
-
-        allRows = [allRows; struct('date',filedate,'unit',unitLabel,'unit_type',unitType,'phy_id',unitIDs(cc), ...
-            'LMS_best_channel',bestChan_LMS,'LMS_R2_best_stim',R2_best_stim_LMS,'LMS_R2_all_stim',R2_all_stim_LMS, ...
-            'LMS_b0',LMS_b0,'LMS_bL',LMS_bL,'LMS_bM',LMS_bM,'LMS_bS',LMS_bS, ...
-            'DKL_best_channel',bestChan_DKL,'DKL_R2_best_stim',R2_best_stim_DKL,'DKL_R2_all_stim',R2_all_stim_DKL, ...
-            'DKL_b0',DKL_b0,'DKL_bLmM',DKL_bLmM,'DKL_bSLpM',DKL_bSLpM)];
     end
-
-    if ~isempty(allRows)
-        T=struct2table(allRows);
-        outCSV=fullfile(outDir,sprintf('%s_STA_LMS_DKL_summary_directfit.csv',filedate));
-        writetable(T,outCSV);
-        fprintf('  [%s] wrote %d rows to %s\n',filedate,height(T),outCSV);
-        allRowsGlobal=[allRowsGlobal;allRows];
+    
+    % Save Global Results
+    if ~isempty(allUnitsResults)
+        outDir = fullfile(config.paths.output, 'tables');
+        if ~exist(outDir, 'dir'), mkdir(outDir); end
+        outPath = fullfile(outDir, 'ALL_3D_Coordinate_Regression.csv');
+        writetable(struct2table(allUnitsResults), outPath);
+        fprintf('\n✅ Results saved to %s\n', outPath);
     end
 end
 
-if ~isempty(allRowsGlobal)
-    T_all=struct2table(allRowsGlobal);
-    allRoot=fullfile(PATHS.baseDiscProbeLocal,'STA_LMSchannels');
-    if ~exist(allRoot,'dir'), mkdir(allRoot); end
-    allCSV=fullfile(allRoot,'ALL_STA_LMS_DKL_summary_directfit.csv');
-    writetable(T_all,allCSV);
-    fprintf('\nWrote global summary with %d rows to %s\n',height(T_all),allCSV);
+% -------------------------------------------------------------------------
+% DEFENSIVE HELPERS (The "Fixers")
+% -------------------------------------------------------------------------
+
+function T = standardize_table_names(T)
+    % Renames columns to a standard set to prevent join errors
+    vars = T.Properties.VariableNames;
+    
+    % Fix Hue
+    if ismember('hueIdx', vars), T.Properties.VariableNames{'hueIdx'} = 'hueID';
+    elseif ismember('hue', vars), T.Properties.VariableNames{'hue'} = 'hueID'; end
+    
+    % Fix Saturation
+    if ismember('satID', vars), T.Properties.VariableNames{'satID'} = 'satVal';
+    elseif ismember('sat', vars), T.Properties.VariableNames{'sat'} = 'satVal'; end
+    
+    % Fix Elevation
+    if ismember('elevVal', vars), T.Properties.VariableNames{'elevVal'} = 'elevID';
+    elseif ismember('elev', vars), T.Properties.VariableNames{'elev'} = 'elevID'; end
 end
 
-fprintf('\nDone.\n');
+function ColorTable = get_standardized_color_table(config)
+    % Load metadata and ensure columns match the standardization
+    colsFile = fullfile(config.paths.code, 'DiscProbeColsUpdated.mat');
+    load(colsFile, 'ProbeColIDs'); % [Hue, Sat, Elev]
+    
+    lmsFile = fullfile(config.paths.code, 'lms.csv');
+    LMS_all = readmatrix(lmsFile); % [L, M, S]
+    
+    % Hard-code names to our internal standard
+    ColorTable = table(ProbeColIDs(:,1), ProbeColIDs(:,2), ProbeColIDs(:,3), ...
+                       LMS_all(:,1), LMS_all(:,2), LMS_all(:,3), ...
+                       'VariableNames', {'hueID','satVal','elevID','L','M','S'});
 end
 
-% ---------------- helpers ----------------
-function val = iff(cond,a,b), if cond, val=a; else, val=b; end, end
-function expFile = locate_expTrialsDisc(PATHS,MONKEY,filedate)
-cands={fullfile(PATHS.baseDiscProbeLocal,filedate,sprintf('%s_%s_ExpTrialsDisc.mat',MONKEY,filedate)), ...
-       fullfile(PATHS.baseDiscProbeLocal,filedate,sprintf('%s_ExpTrialsDisc.mat',filedate)), ...
-       fullfile(PATHS.baseDiscProbeLocal,sprintf('%s_ExpTrialsDisc.mat',filedate))};
-expFile='';
-for i=1:numel(cands)
-    if isfile(cands{i}), expFile=cands{i}; break; end
-end
-end
-function info=find_sta_file(PATHS,filedate,unitType,phyID)
-info=struct('fullpath','','name','');
-staDir=fullfile(PATHS.baseDiscProbeLocal,filedate,'STAs');
-if ~exist(staDir,'dir'),return;end
-phyTag=sprintf('phy%05d',phyID);
-umTag=tern(strcmpi(unitType,'SU'),'SU','MU');
-d=dir(fullfile(staDir,sprintf('*%s_%s*_STA.mat',phyTag,umTag)));
-if isempty(d),d=dir(fullfile(staDir,sprintf('*%s*_STA.mat',phyTag)));end
-if isempty(d),return;end
-info.fullpath=fullfile(staDir,d(1).name);
-info.name=d(1).name;
-end
-function out=tern(cond,a,b),if cond,out=a;else,out=b;end,end
-
-function [w_chan, chanNames] = grand_sta_per_color(staPath)
-S = load(staPath);
-if ~isfield(S,'STA'), error('STA variable not found in %s', staPath); end
-STA = S.STA;
-if numel(STA)>1, STA = STA(1); end
-if ~isfield(STA,'sta_flat') || ~isfield(STA,'color_channels')
-    error('STA.sta_flat or color_channels missing.');
-end
-
-sta_flat = STA.sta_flat;
-chanNames = cellstr(STA.color_channels);
-nColor = numel(chanNames);
-[~, nCols] = size(sta_flat);
-
-% safer handling to avoid reshape error
-if nCols == nColor
-    w_chan = mean(sta_flat,1);
-elseif mod(nCols,nColor)==0
-    nPix = nCols/nColor;
-    sta_resh = reshape(sta_flat,[],nPix,nColor);
-    w_chan = squeeze(sum(sum(sta_resh,1),2));
-    w_chan = w_chan(:)';
-else
-    warning('STA format unexpected (%d cols, %d colors). Using column means.', nCols, nColor);
-    w_chan = mean(sta_flat,1);
-end
-
-names_upper = upper(strtrim(chanNames(:)));
-isRGB = (nColor==3)&&all(ismember(names_upper,{'R','G','B'}));
-if isRGB
-    [tL,tM,tS]=get_gun_LMS_weights();
-    order=cellfun(@(n)find(strcmp({'R','G','B'},n)),names_upper);
-    w_chan=[dot(w_chan,tL(order)),dot(w_chan,tM(order)),dot(w_chan,tS(order))];
-    chanNames={'L','M','S'};
-end
-end
-
-function [tL,tM,tS]=get_gun_LMS_weights()
-rx=0.6280;ry=0.3310;gx=0.3059;gy=0.5826;bx=0.1639;by=0.0617;
-Wr=18.6469/2;Wg=75.8449/2;Wb=10.5313/2;
-R=cie2lms(rx,ry);G=cie2lms(gx,gy);B=cie2lms(bx,by);
-M=[R;G;B]'*diag([Wr Wg Wb]);
-tL=M(1,:)';tM=M(2,:)';tS=M(3,:)';
-end
-
-function v=cie2lms(a,b)
-x=a;y=b;z=1-x-y;
-M=[.15514 .54316 -.03286;-.15514 .45684 .03286;0 0 .01608];
-lms=(M*[x;y;z])';
-den=lms(1)+lms(2);
-v=[lms(1)/den,lms(2)/den,lms(3)/den];
-end
-
-function [bestIdx, bestName, R2_best_trial, R2_all_trial, ...
-          R2_all_boot_mean, R2_all_boot_ci, ...
-          tf_intercept, tf_betas, ...
-          R2_best_stim, R2_all_stim] = ...
-    compute_space_stats_direct(G_trial, y, stimID, nSat, nHue, ...
-                               chanNames, N_BOOT_REPS, nStim)
-
-if nargin < 7 || isempty(N_BOOT_REPS)
-    N_BOOT_REPS = 1000;
-end
-if nargin < 8 || isempty(nStim)
-    nStim = nSat * nHue;
-end
-
-nChan   = size(G_trial,2);
-bestIdx = NaN; bestName = '';
-R2_best_trial = NaN; R2_all_trial = NaN;
-R2_best_stim  = NaN; R2_all_stim  = NaN;
-R2_all_boot_mean = NaN; R2_all_boot_ci = [NaN NaN];
-tf_intercept = NaN; tf_betas = nan(1,nChan);
-
-if isempty(G_trial) || isempty(y) || isempty(stimID)
-    return;
-end
-
-% mean firing per stimulus
-y_stim_full = accumarray(stimID, y, [nStim 1], @mean, NaN);
-G_stim_full = nan(nStim, nChan);
-for c = 1:nChan
-    gc = double(G_trial(:,c));
-    G_stim_full(:,c) = accumarray(stimID, gc, [nStim 1], @mean, NaN);
-end
-
-goodStim = isfinite(y_stim_full) & any(isfinite(G_stim_full), 2);
-if nnz(goodStim) < 5, return; end
-
-y_stim = y_stim_full(goodStim);
-G_stim = G_stim_full(goodStim, :);
-
-% best single channel R²
-R2_each_stim = nan(1,nChan);
-for c = 1:nChan
-    gs = G_stim(:,c);
-    good_c = isfinite(y_stim) & isfinite(gs);
-    if nnz(good_c) < 5, continue; end
-    ys = y_stim(good_c);
-    gs_good = gs(good_c);
-    Xs = [ones(nnz(good_c),1) gs_good];
-    bs = Xs \ ys;
-    yhat = Xs * bs;
-    SST = sum((ys - mean(ys)).^2);
-    SSE = sum((ys - yhat).^2);
-    R2_each_stim(c) = 1 - SSE / max(SST, eps);
-end
-
-[~, idxMax] = max(R2_each_stim);
-if isempty(idxMax) || ~isfinite(R2_each_stim(idxMax)), return; end
-
-bestIdx = idxMax;
-bestName = chanNames{bestIdx};
-R2_best_stim = R2_each_stim(bestIdx);
-
-% multichannel R²
-good_all = isfinite(y_stim) & all(isfinite(G_stim),2);
-if nnz(good_all) >= 5
-    ys_all = y_stim(good_all);
-    Xs_all = [ones(nnz(good_all),1) G_stim(good_all,:)];
-    bs_all = Xs_all \ ys_all;
-    tf_intercept = bs_all(1);
-    tf_betas = bs_all(2:end).';
-    yhat_all = Xs_all * bs_all;
-    SST = sum((ys_all - mean(ys_all)).^2);
-    SSE = sum((ys_all - yhat_all).^2);
-    R2_all_stim = 1 - SSE / max(SST, eps);
-end
-
-% match legacy fieldnames for compatibility
-R2_best_trial = R2_best_stim;
-R2_all_trial = R2_all_stim;
-
-% bootstrap on stimulus means
-idxValid = find(good_all);
-nValidStim = numel(idxValid);
-if nValidStim < 10, return; end
-
-R2_boot = nan(N_BOOT_REPS,1);
-for r = 1:N_BOOT_REPS
-    bootSel = idxValid(randi(nValidStim, nValidStim, 1));
-    boot_y = y_stim_full(bootSel);
-    boot_G = G_stim_full(bootSel,:);
-    good_b = isfinite(boot_y) & all(isfinite(boot_G),2);
-    if nnz(good_b) < 5, continue; end
-    yb = boot_y(good_b);
-    Xb = [ones(nnz(good_b),1) boot_G(good_b,:)];
-    try
-        bb = Xb \ yb;
-        yhat_b = Xb * bb;
-        SST_b = sum((yb - mean(yb)).^2);
-        SSE_b = sum((yb - yhat_b).^2);
-        R2_boot(r) = 1 - SSE_b / max(SST_b, eps);
-    catch
-        R2_boot(r) = NaN;
+function actualName = resolve_session_folder(basePath, inputStr)
+    actualName = '';
+    if exist(fullfile(basePath, inputStr), 'dir')
+        actualName = inputStr;
+        return;
+    end
+    if regexp(inputStr, '^\d{6}$')
+        d = dir(fullfile(basePath, ['*' inputStr '*']));
+        isDir = [d.isdir] & ~ismember({d.name}, {'.','..'});
+        matches = d(isDir);
+        if ~isempty(matches), actualName = matches(1).name; end
     end
 end
-
-if sum(isfinite(R2_boot)) >= 10
-    R2_all_boot_mean = mean(R2_boot,'omitnan');
-    R2_all_boot_ci = prctile(R2_boot(isfinite(R2_boot)),[2.5 97.5]);
-end
-end
-% ===== END FILE: DiscProbe_STA_LMSLINv6_DirectFit.m =====
+% ===== END FILE: DiscProbe_3D_Coordinate_Regression.m =====
 
 % ===== FILE: dump_repo_to_text.m =====
 % ===== START =====
@@ -804,6 +549,542 @@ fprintf('\nDone.\n');
 end
 % ===== END FILE: run_discprobe_analysis.m =====
 
+% ===== FILE: run_linearmodel_directfit_dkllms.m =====
+% ===== START =====
+function run_linearmodel_directfit_dkllms(DATES)
+% DiscProbe_STA_LMSLINv6_DirectFit - Fits LMS/DKL models to mean rates.
+% Fits models using Grand STA weights projected onto trial stimuli.
+%
+% SAVES TO:
+%   1. output/sta/<Session>/ (CSV summary)
+%   2. data/<Session>/sta/   (Local copy)
+%   3. output/tables/        (Global summary)
+
+    clc;
+    rootDir = fileparts(mfilename('fullpath'));
+    addpath(genpath(rootDir));
+    
+    config = load_config();
+    COL    = load_color_metadata(config); 
+    
+    % --- 1. DATE HANDLING ---
+    if nargin < 1 || isempty(DATES)
+        DATES = 'all';
+    end
+    
+    if ischar(DATES) || isstring(DATES)
+        ds = strtrim(char(DATES));
+        if strcmpi(ds, 'all')
+            d = dir(config.paths.base);
+            names = {d([d.isdir]).name};
+            % Filter for folders looking like dates (6 digits) or SessionIDs
+            validIdx = cellfun(@(s) ~isempty(regexp(s, '\d{6}', 'once')), names) & ...
+                       ~ismember(names, {'.','..'});
+            DATES = sort(names(validIdx));
+        else
+            DATES = {ds};
+        end
+    else
+        DATES = cellstr(DATES);
+    end
+
+    warning('off','stats:glmfit:IllConditioned');
+    warning('off','stats:glmfit:IterationLimit');
+    warning('off','MATLAB:rankDeficientMatrix');
+
+    timeWin     = [0 0.2];
+    saturIDs    = [0.33 0.66 1];
+    nSat        = numel(saturIDs);
+    N_BOOT_REPS = 1000;
+    
+    allRowsGlobal = [];
+
+    % ------------- Keep List ----------------
+    % Pass the OUTPUT/TABLES directory explicitly, or rely on the robust search in the function
+    % We try to pass the exact location of the global tables first.
+    keepMapDir = fullfile(config.paths.output, 'tables'); 
+    keepMap = load_keep_map(keepMapDir); 
+    
+    if isempty(keepMap)
+        % Fallback to base if empty (legacy support)
+        keepMap = load_keep_map(config.paths.base);
+    end
+
+    % ------------- Color Metadata ----------------
+    lmsFile = fullfile(config.paths.code, 'lms.csv');
+    if ~isfile(lmsFile), error('Missing lms.csv at %s', lmsFile); end
+    LMS_all = readmatrix(lmsFile);
+    
+    if isfield(COL, 'nHue')
+        nHue = COL.nHue;
+    else
+        colsFile = fullfile(config.paths.code, 'DiscProbeColsUpdated.mat');
+        if isfile(colsFile)
+            tmp = load(colsFile, 'ProbeColIDs');
+            nHue = max(tmp.ProbeColIDs(:,1));
+        else
+            nHue = 16; 
+        end
+    end
+    
+    try
+        LMS_satur2 = reshape(LMS_all(1:nSat*nHue,1:3), [nSat, nHue, 3]);
+    catch
+        error('lms.csv rows (%d) do not match nSat*nHue (%d*%d)', size(LMS_all,1), nSat, nHue);
+    end
+
+    % --- OUTPUT PATHS ---
+    outRootCentral = fullfile(config.paths.output, 'sta');
+    if ~exist(outRootCentral, 'dir'), mkdir(outRootCentral); end
+    
+    outRootGlobal = fullfile(config.paths.output, 'tables');
+    if ~exist(outRootGlobal, 'dir'), mkdir(outRootGlobal); end
+
+    % =====================================================================
+    % LOOP OVER SESSIONS
+    % =====================================================================
+    for idate = 1:numel(DATES)
+        targetDateStr = char(DATES{idate});
+        
+        % Resolve actual folder name (e.g., '250513' -> 'Jacomo_250513')
+        sessionFolderName = resolve_session_folder(config.paths.base, targetDateStr);
+        if isempty(sessionFolderName)
+            warning('Folder for %s not found. Skipping.', targetDateStr);
+            continue;
+        end
+        
+        fprintf('\n=== %s: Direct LMS & DKL fitting ===\n', sessionFolderName);
+
+        % --- PATH SETUP ---
+        localSessDir  = fullfile(config.paths.base, sessionFolderName);
+        
+        % 1. Central Output
+        outDirCentral = fullfile(outRootCentral, sessionFolderName);
+        if ~exist(outDirCentral, 'dir'), mkdir(outDirCentral); end
+        
+        % 2. Local Output
+        outDirLocal = fullfile(localSessDir, 'sta');
+        if ~exist(outDirLocal, 'dir'), mkdir(outDirLocal); end
+
+        % --- LOAD SESSION ---
+        try
+            S = load_session(sessionFolderName, config);
+        catch ME
+            fprintf('  [%s] Load failed: %s\n', sessionFolderName, ME.message);
+            continue;
+        end
+        
+        if isfield(S, 'ExptTrialsDisc')
+             T = make_trial_index_table(S, COL, config);
+        else
+             warning('ExptTrialsDisc missing in S.');
+             continue;
+        end
+        
+        nTrials = height(T);
+        
+        % Robust Column Handling
+        if ismember('hueID', T.Properties.VariableNames), hueIdx = T.hueID;
+        elseif ismember('hueIdx', T.Properties.VariableNames), hueIdx = T.hueIdx;
+        elseif ismember('hue', T.Properties.VariableNames), hueIdx = T.hue;
+        else, warning('T table missing hueID. Skipping.'); continue; end
+        
+        if ismember('satID', T.Properties.VariableNames), satVal = T.satID;
+        elseif ismember('satVal', T.Properties.VariableNames), satVal = T.satVal;
+        elseif ismember('sat', T.Properties.VariableNames), satVal = T.sat;
+        else, satVal = nan(nTrials,1); end
+        
+        [satIdx, okSat] = ismember(satVal, saturIDs);
+        validStim = okSat & hueIdx >= 1 & hueIdx <= nHue;
+        
+        % LMS Matrix
+        trial_LMS = nan(nTrials, 3);
+        for t = 1:nTrials
+            if validStim(t)
+                trial_LMS(t,:) = squeeze(LMS_satur2(satIdx(t), hueIdx(t), :));
+            end
+        end
+
+        % Count Spikes
+        spkcounts_all = nan(nTrials, S.nUnits);
+        for cc = 1:S.nUnits
+            unitSpikes = S.spk{cc};
+            for t = 1:nTrials
+                spks = unitSpikes{t};
+                n = sum(spks >= timeWin(1) & spks < timeWin(2));
+                spkcounts_all(t, cc) = n;
+            end
+        end
+
+        allRows = [];
+        
+        % --- LOOP OVER UNITS ---
+        for cc = 1:S.nUnits
+            phyID = S.unitIDs(cc);
+            if isfield(S, 'unitTypes')
+                unitType = S.unitTypes{cc};
+            else
+                unitType = '?'; 
+            end
+            unitLabel = sprintf('%s%d', unitType, phyID);
+
+            % --- CHECK KEEP LIST ---
+            if ~isempty(keepMap)
+                % Try key with Full Session Name (e.g. Jacomo_250513_SU1)
+                keyFull = sprintf('%s_%s', sessionFolderName, unitLabel);
+                
+                % Try key with just Date (e.g. 250513_SU1) - fallback match
+                keyDate = sprintf('%s_%s', targetDateStr, unitLabel);
+                
+                keepVal = 0; % Default to drop if map exists but key missing
+                
+                if isKey(keepMap, keyFull)
+                    keepVal = keepMap(keyFull);
+                elseif isKey(keepMap, keyDate)
+                    keepVal = keepMap(keyDate);
+                else
+                    % If not in map at all, assume we shouldn't process it (or strictly enforce list)
+                    % If your logic is "Only process what is in list", then keepVal=0.
+                    % If your logic is "Process unless excluded", change this.
+                    % Based on previous context: "Keep list" implies strict inclusion.
+                    keepVal = 0; 
+                end
+                
+                if keepVal == 0
+                    % fprintf('Skipping %s (Not in keep list)\n', keyFull);
+                    continue; 
+                end
+            end
+            
+            % Locate STA
+            staFileInfo = find_sta_file(localSessDir, unitType, phyID);
+            if isempty(staFileInfo), continue; end
+            
+            try
+                [w_chan, chanNames_sta] = grand_sta_per_color(staFileInfo.fullpath);
+            catch ME
+                fprintf('  [%s] %s: STA load failed: %s\n', sessionFolderName, unitLabel, ME.message);
+                continue;
+            end
+            
+            idxL = find(strcmpi(chanNames_sta,'L'),1);
+            idxM = find(strcmpi(chanNames_sta,'M'),1);
+            idxS = find(strcmpi(chanNames_sta,'S'),1);
+            
+            if isempty(idxL) || isempty(idxM), continue; end
+            
+            wL = w_chan(idxL); 
+            wM = w_chan(idxM);
+            hasS = ~isempty(idxS); 
+            if hasS, wS = w_chan(idxS); end
+            
+            L_disc_all = trial_LMS(:,1);
+            M_disc_all = trial_LMS(:,2);
+            if hasS, S_disc_all = trial_LMS(:,3); end
+            
+            y_all = spkcounts_all(:, cc);
+            
+            if hasS
+                valid = validStim & isfinite(L_disc_all) & isfinite(M_disc_all) & isfinite(S_disc_all) & isfinite(y_all);
+            else
+                valid = validStim & isfinite(L_disc_all) & isfinite(M_disc_all) & isfinite(y_all);
+            end
+            
+            if nnz(valid) < 20, continue; end
+            
+            y = y_all(valid);
+            L_disc = L_disc_all(valid);
+            M_disc = M_disc_all(valid);
+            if hasS, S_disc = S_disc_all(valid); end
+            
+            stimID = sub2ind([nSat nHue], satIdx(valid), hueIdx(valid));
+            nStim  = nSat * nHue;
+            
+            % --- LMS Direct Fit ---
+            gL = wL * L_disc; gM = wM * M_disc;
+            if hasS
+                gS = wS * S_disc;
+                G_LMS = [gL, gM, gS]; chanNames_LMS = {'L','M','S'};
+            else
+                G_LMS = [gL, gM]; chanNames_LMS = {'L','M'};
+            end
+            
+            [~, bestChan_LMS, ~, ~, ~, ~, LMS_b0, LMS_betas, R2_best_stim_LMS, R2_all_stim_LMS] = ...
+                compute_space_stats_direct(G_LMS, y, stimID, nSat, nHue, chanNames_LMS, N_BOOT_REPS, nStim);
+            
+            LMS_bL=NaN; LMS_bM=NaN; LMS_bS=NaN;
+            for ii=1:numel(chanNames_LMS)
+                switch upper(chanNames_LMS{ii})
+                    case 'L', LMS_bL=LMS_betas(ii);
+                    case 'M', LMS_bM=LMS_betas(ii);
+                    case 'S', LMS_bS=LMS_betas(ii);
+                end
+            end
+            
+            % --- DKL Direct Fit ---
+            bestChan_DKL=''; R2_best_stim_DKL=NaN; R2_all_stim_DKL=NaN;
+            DKL_b0=NaN; DKL_bLmM=NaN; DKL_bSLpM=NaN;
+            
+            if hasS
+                g_LmM = wL*L_disc - wM*M_disc;
+                g_S_LpM = wS*S_disc - (wL*L_disc + wM*M_disc);
+                G_DKL = [g_LmM, g_S_LpM];
+                chanNames_DKL = {'L_minus_M', 'S_minus_LpM'};
+                
+                [~, bestChan_DKL, ~, ~, ~, ~, DKL_b0, DKL_betas, R2_best_stim_DKL, R2_all_stim_DKL] = ...
+                    compute_space_stats_direct(G_DKL, y, stimID, nSat, nHue, chanNames_DKL, N_BOOT_REPS, nStim);
+                
+                for ii=1:numel(chanNames_DKL)
+                    switch chanNames_DKL{ii}
+                        case 'L_minus_M', DKL_bLmM=DKL_betas(ii);
+                        case 'S_minus_LpM', DKL_bSLpM=DKL_betas(ii);
+                    end
+                end
+            end
+            
+            fprintf('  [%s] %s | LMS best=%s R2=%.2f | DKL best=%s R2=%.2f\n', ...
+                sessionFolderName, unitLabel, bestChan_LMS, R2_all_stim_LMS, bestChan_DKL, R2_all_stim_DKL);
+                
+            allRows = [allRows; struct(...
+                'date', sessionFolderName, 'unit', unitLabel, 'unit_type', unitType, 'phy_id', phyID, ...
+                'LMS_best_channel', bestChan_LMS, 'LMS_R2_best_stim', R2_best_stim_LMS, 'LMS_R2_all_stim', R2_all_stim_LMS, ...
+                'LMS_b0', LMS_b0, 'LMS_bL', LMS_bL, 'LMS_bM', LMS_bM, 'LMS_bS', LMS_bS, ...
+                'DKL_best_channel', bestChan_DKL, 'DKL_R2_best_stim', R2_best_stim_DKL, 'DKL_R2_all_stim', R2_all_stim_DKL, ...
+                'DKL_b0', DKL_b0, 'DKL_bLmM', DKL_bLmM, 'DKL_bSLpM', DKL_bSLpM)];
+        end
+        
+        % --- SAVE PER SESSION ---
+        if ~isempty(allRows)
+            T = struct2table(allRows);
+            csvName = sprintf('%s_STA_LMS_DKL_summary_directfit.csv', sessionFolderName);
+            writetable(T, fullfile(outDirCentral, csvName));
+            writetable(T, fullfile(outDirLocal, csvName));
+            fprintf('  > Saved CSV to: %s\n', outDirCentral);
+            allRowsGlobal = [allRowsGlobal; allRows];
+        end
+    end
+    
+    % --- SAVE GLOBAL SUMMARY ---
+    if ~isempty(allRowsGlobal)
+        T_all = struct2table(allRowsGlobal);
+        globalCSV = fullfile(outRootGlobal, 'ALL_STA_LMS_DKL_summary_directfit.csv');
+        writetable(T_all, globalCSV);
+        fprintf('\n✅ Wrote Global Summary (%d rows) to %s\n', height(T_all), globalCSV);
+    end
+    fprintf('\nDone.\n');
+end
+
+% ... [KEEP THE HELPER FUNCTIONS FROM BEFORE: resolve_session_folder, find_sta_file, grand_sta_per_color, etc] ...
+% (Include the helpers from my previous response here)
+
+function actualName = resolve_session_folder(basePath, inputStr)
+    actualName = '';
+    if exist(fullfile(basePath, inputStr), 'dir')
+        actualName = inputStr;
+        return;
+    end
+    if regexp(inputStr, '^\d{6}$')
+        d = dir(fullfile(basePath, ['*' inputStr '*']));
+        isDir = [d.isdir] & ~ismember({d.name}, {'.','..'});
+        matches = d(isDir);
+        if ~isempty(matches)
+            actualName = matches(1).name;
+        end
+    end
+end
+
+function info = find_sta_file(sessionDir, unitType, phyID)
+    info = struct('fullpath','','name','');
+    staDir = fullfile(sessionDir, 'STAs');
+    if ~exist(staDir,'dir'), return; end
+    
+    phyTag = sprintf('phy%05d', phyID);
+    if strcmpi(unitType, 'SU')
+        umTag = 'SU';
+    else
+        umTag = 'MU';
+    end
+    
+    d = dir(fullfile(staDir, sprintf('*%s_%s*_STA.mat', phyTag, umTag)));
+    if isempty(d)
+        d = dir(fullfile(staDir, sprintf('*%s*_STA.mat', phyTag)));
+    end
+    
+    if ~isempty(d)
+        info.fullpath = fullfile(staDir, d(1).name);
+        info.name = d(1).name;
+    end
+end
+
+function [w_chan, chanNames] = grand_sta_per_color(staPath)
+    S = load(staPath);
+    if ~isfield(S,'STA'), error('STA variable not found in %s', staPath); end
+    STA = S.STA;
+    if numel(STA)>1, STA = STA(1); end
+    if ~isfield(STA,'sta_flat') || ~isfield(STA,'color_channels')
+        error('STA.sta_flat or color_channels missing.');
+    end
+    sta_flat = STA.sta_flat;
+    chanNames = cellstr(STA.color_channels);
+    nColor = numel(chanNames);
+    [~, nCols] = size(sta_flat);
+    
+    if nCols == nColor
+        w_chan = mean(sta_flat,1);
+    elseif mod(nCols,nColor)==0
+        nPix = nCols/nColor;
+        sta_resh = reshape(sta_flat,[],nPix,nColor);
+        w_chan = squeeze(sum(sum(sta_resh,1),2));
+        w_chan = w_chan(:)';
+    else
+        warning('STA format unexpected (%d cols, %d colors). Using column means.', nCols, nColor);
+        w_chan = mean(sta_flat,1);
+    end
+    
+    names_upper = upper(strtrim(chanNames(:)));
+    isRGB = (nColor==3) && all(ismember(names_upper,{'R','G','B'}));
+    if isRGB
+        [tL,tM,tS] = get_gun_LMS_weights();
+        % Reorder transform to match channel order
+        wL_val = 0; wM_val = 0; wS_val = 0;
+        for i=1:3
+            nm = names_upper{i};
+            val = w_chan(i);
+            switch nm
+                case 'R', wL_val=wL_val+val*tL(1); wM_val=wM_val+val*tM(1); wS_val=wS_val+val*tS(1);
+                case 'G', wL_val=wL_val+val*tL(2); wM_val=wM_val+val*tM(2); wS_val=wS_val+val*tS(2);
+                case 'B', wL_val=wL_val+val*tL(3); wM_val=wM_val+val*tM(3); wS_val=wS_val+val*tS(3);
+            end
+        end
+        w_chan = [wL_val, wM_val, wS_val];
+        chanNames = {'L','M','S'};
+    end
+end
+
+function [tL,tM,tS] = get_gun_LMS_weights()
+    rx=0.6280; ry=0.3310; gx=0.3059; gy=0.5826; bx=0.1639; by=0.0617;
+    Wr=18.6469/2; Wg=75.8449/2; Wb=10.5313/2;
+    R=cie2lms(rx,ry); G=cie2lms(gx,gy); B=cie2lms(bx,by);
+    M = [R;G;B]' * diag([Wr Wg Wb]);
+    tL=M(1,:)'; tM=M(2,:)'; tS=M(3,:)';
+end
+
+function v = cie2lms(a,b)
+    x=a; y=b; z=1-x-y;
+    M = [.15514 .54316 -.03286; -.15514 .45684 .03286; 0 0 .01608];
+    lms = (M*[x;y;z])';
+    den = lms(1)+lms(2);
+    v = [lms(1)/den, lms(2)/den, lms(3)/den];
+end
+
+function [bestIdx, bestName, R2_best_trial, R2_all_trial, ...
+          R2_all_boot_mean, R2_all_boot_ci, ...
+          tf_intercept, tf_betas, ...
+          R2_best_stim, R2_all_stim] = ...
+    compute_space_stats_direct(G_trial, y, stimID, nSat, nHue, ...
+                               chanNames, N_BOOT_REPS, nStim)
+
+    if nargin < 7 || isempty(N_BOOT_REPS), N_BOOT_REPS = 1000; end
+    if nargin < 8 || isempty(nStim), nStim = nSat * nHue; end
+    
+    nChan   = size(G_trial,2);
+    bestIdx = NaN; bestName = '';
+    R2_best_trial = NaN; R2_all_trial = NaN;
+    R2_best_stim  = NaN; R2_all_stim  = NaN;
+    R2_all_boot_mean = NaN; R2_all_boot_ci = [NaN NaN];
+    tf_intercept = NaN; tf_betas = nan(1,nChan);
+    
+    if isempty(G_trial) || isempty(y) || isempty(stimID), return; end
+    
+    y_stim_full = accumarray(stimID, y, [nStim 1], @mean, NaN);
+    G_stim_full = nan(nStim, nChan);
+    for c = 1:nChan
+        gc = double(G_trial(:,c));
+        G_stim_full(:,c) = accumarray(stimID, gc, [nStim 1], @mean, NaN);
+    end
+    
+    goodStim = isfinite(y_stim_full) & any(isfinite(G_stim_full), 2);
+    if nnz(goodStim) < 5, return; end
+    
+    y_stim = y_stim_full(goodStim);
+    G_stim = G_stim_full(goodStim, :);
+    
+    R2_each_stim = nan(1,nChan);
+    for c = 1:nChan
+        gs = G_stim(:,c);
+        good_c = isfinite(y_stim) & isfinite(gs);
+        if nnz(good_c) < 5, continue; end
+        
+        ys = y_stim(good_c);
+        gs_good = gs(good_c);
+        Xs = [ones(nnz(good_c),1) gs_good];
+        
+        bs = Xs \ ys;
+        yhat = Xs * bs;
+        
+        SST = sum((ys - mean(ys)).^2);
+        SSE = sum((ys - yhat).^2);
+        R2_each_stim(c) = 1 - SSE / max(SST, eps);
+    end
+    
+    [~, idxMax] = max(R2_each_stim);
+    if ~isempty(idxMax) && isfinite(R2_each_stim(idxMax))
+        bestIdx = idxMax;
+        bestName = chanNames{bestIdx};
+        R2_best_stim = R2_each_stim(bestIdx);
+    end
+    
+    good_all = isfinite(y_stim) & all(isfinite(G_stim),2);
+    if nnz(good_all) >= 5
+        ys_all = y_stim(good_all);
+        Xs_all = [ones(nnz(good_all),1) G_stim(good_all,:)];
+        
+        bs_all = Xs_all \ ys_all;
+        tf_intercept = bs_all(1);
+        tf_betas = bs_all(2:end).';
+        
+        yhat_all = Xs_all * bs_all;
+        SST = sum((ys_all - mean(ys_all)).^2);
+        SSE = sum((ys_all - yhat_all).^2);
+        R2_all_stim = 1 - SSE / max(SST, eps);
+    end
+    
+    R2_best_trial = R2_best_stim;
+    R2_all_trial = R2_all_stim;
+    
+    idxValid = find(good_all);
+    nValidStim = numel(idxValid);
+    if nValidStim < 10, return; end
+    
+    R2_boot = nan(N_BOOT_REPS,1);
+    for r = 1:N_BOOT_REPS
+        bootSel = idxValid(randi(nValidStim, nValidStim, 1));
+        boot_y = y_stim_full(bootSel);
+        boot_G = G_stim_full(bootSel,:);
+        
+        good_b = isfinite(boot_y) & all(isfinite(boot_G),2);
+        if nnz(good_b) < 5, continue; end
+        
+        yb = boot_y(good_b);
+        Xb = [ones(nnz(good_b),1) boot_G(good_b,:)];
+        try
+            bb = Xb \ yb;
+            yhat_b = Xb * bb;
+            SST_b = sum((yb - mean(yb)).^2);
+            SSE_b = sum((yb - yhat_b).^2);
+            R2_boot(r) = 1 - SSE_b / max(SST_b, eps);
+        catch
+            R2_boot(r) = NaN;
+        end
+    end
+    
+    if sum(isfinite(R2_boot)) >= 10
+        R2_all_boot_mean = mean(R2_boot,'omitnan');
+        R2_all_boot_ci = prctile(R2_boot(isfinite(R2_boot)),[2.5 97.5]);
+    end
+end
+% ===== END FILE: run_linearmodel_directfit_dkllms.m =====
+
 % ===== FILE: run_sphere_slicer.m =====
 % ===== START =====
 function run_sphere_slicer(sessionID, config)
@@ -1080,210 +1361,291 @@ end
 % ===== FILE: run_vss_peakmodels.m =====
 % ===== START =====
 function run_vss_peakmodels(DATES)
+% RUN_VSS_PEAKMODELS - Wrapper for VSS abstract analysis.
+% Fits harmonic peak models (unimodal vs bimodal) to max saturation trials.
+% Generates CSV tables for peak classification and hue means.
+% SAVES TO: 
+%   1. output/vss/<Folder_Name>/tables/
+%   2. data/<Folder_Name>/tables/vss/ (Local copy)
 
-%this script is the wrapper i used for the data for abstract submission for vss
-
-clc;
-
-
-%the file lives in the root directory
-rootDir = fileparts(mfilename('fullpath'));
-addpath(genpath(rootDir));
-
-config = load_config(); %load config
-COL    = load_color_metadata(config); %prepare color look up tables etc
-
-if nargin < 1 || isempty(DATES)
-    DATES = {'all'};
-end
-%by default, the wrapper will run every session
-
-% for 'all' option 
-if ischar(DATES) || isstring(DATES)
-    ds = strtrim(char(DATES));
-    if strcmpi(ds, 'all')
-        baseRoot = config.paths.base; %where mats live
-        dInfo = dir(baseRoot);
-        names = {dInfo.name};
-        isDateDir = [dInfo.isdir] & ...
-            ~ismember(names, {'.','..'}) & ...
-            ~cellfun(@isempty, regexp(names, '^\d{6}$', 'once'));
-        DATES = sort(names(isDateDir));
-    else
-        DATES = {ds};
+    clc;
+    % --- 1. SETUP & CONFIG ---
+    rootDir = fileparts(mfilename('fullpath'));
+    addpath(genpath(rootDir));
+    
+    config = load_config(); 
+    COL    = load_color_metadata(config); 
+    
+    % --- 2. DATE HANDLING ---
+    if nargin < 1 || isempty(DATES)
+        DATES = 'all';
     end
-end
-
-DATES = normalize_dates(DATES);
-
-% RNG & flags
-if isfield(config, 'pt') && isfield(config.pt, 'seed')
-    rng(config.pt.seed);
-end
-
-doFlag = @(name,def) (isfield(config,'do') && isfield(config.do,name) && ...
-                     all(logical(config.do.(name)(:)))) || ...
-                     (~isfield(config,'do') && def);
-
-%do you want to drop outliers? (usually ALWAYS yes)
-DO_DROP_OUTLIERS   = doFlag('dropOutliers',true);
-%do you want to save mats?
-DO_SAVE_UNIT_MATS  = doFlag('saveVssUnitMats',true);
-%do you want to build the "keep" list that is used in other analysis?
-DO_BUILD_KEEP_LIST = doFlag('buildVssKeep',true);
-
-%empty table that will have all out kept units
-allKeepRows = table();
-
-for d = 1:numel(DATES)
-    dateStr = char(DATES{d});
-    fprintf('\n single vs two peak-model analysis: %s\n', dateStr);
-
-    %get session paths so it knows where to save stuff
-    SPaths = get_session_paths(config, dateStr);
-    if ~exist(SPaths.session,'dir'), mkdir(SPaths.session); end
-    if ~exist(SPaths.units,'dir'),   mkdir(SPaths.units);   end
-    if ~exist(SPaths.tables,'dir'),  mkdir(SPaths.tables);  end
-
-    % lets store VSS results under /vss/<date>/tables
-    vssRoot = fullfile(config.paths.output, 'vss');
-    vssSess = fullfile(vssRoot, dateStr); 
-    vssTables = fullfile(vssSess, 'tables');
-    if ~exist(vssTables, 'dir'), mkdir(vssTables); end
-
-    %load .mat for that session with all the spikes 
-    try
-        S = load_session(dateStr, config);
-    catch ME
-        warning('Could not load session %s: %s', dateStr, ME.message);
-        continue;
-    end
-
-    %preparing unit
-    S = filter_zero_spike_units(S, config); %drop units with 0 spikes
-    T = make_trial_index_table(S, COL, config); %make trial index with all trials for the session
-    %this is to get their rgbs, dkl, lms values per trial
-
-    peakRows = table();
-    meanRows = table();
-    fourRows = table();
-
-    alpha = 0.05;
-    if isfield(config,'tuning') && isfield(config.tuning,'alphaHarmonic')
-        alpha = config.tuning.alphaHarmonic;
-    end
-
-    for unitIdx = 1:S.nUnits
-        fprintf('  unit %d/%d (ID=%d)\n', unitIdx, S.nUnits, S.unitIDs(unitIdx));
-        U = prepare_unit(S, unitIdx, T, config);
-        %get all spike info for unit and unit metadata
-
-
-        %drop outliers (spikes that fall beyond 1.5 IQR for every trial
-        %type
-        if DO_DROP_OUTLIERS
-            U = detect_outliers(U, config);
+    
+    % Expand 'all' into list of session folders
+    if ischar(DATES) || isstring(DATES)
+        ds = strtrim(char(DATES));
+        if strcmpi(ds, 'all')
+            baseRoot = config.paths.base; 
+            dInfo = dir(baseRoot);
+            names = {dInfo.name};
+            % Find folders that look like dates (6 digits) or SessionIDs (Name_Date)
+            isDateDir = [dInfo.isdir] & ~ismember(names, {'.','..'});
+            % Filter for folders containing the date pattern
+            validIdx = find(isDateDir);
+            finalList = {};
+            for k = validIdx
+                if regexp(names{k}, '\d{6}')
+                    finalList{end+1} = names{k}; %#ok<AGROW>
+                end
+            end
+            DATES = sort(finalList);
+        else
+            DATES = {ds};
         end
+    end
+    
+    % --- 3. FLAGS & SEEDS ---
+    if isfield(config, 'pt') && isfield(config.pt, 'seed')
+        rng(config.pt.seed);
+    end
+    
+    doFlag = @(name,def) (isfield(config,'analysis') && isfield(config.analysis,name) && ...
+                         all(logical(config.analysis.(name)(:)))) || ...
+                         (~isfield(config,'analysis') && def);
+                     
+    DO_DROP_OUTLIERS   = doFlag('dropOutliers', true);
+    DO_SAVE_UNIT_MATS  = doFlag('saveVssUnitMats', true);
+    DO_BUILD_KEEP_LIST = doFlag('buildVssKeep', true);
+    
+    allKeepRows = table();
 
+    % --- 4. OUTPUT PATHS (Centralized) ---
+    vssRoot = fullfile(config.paths.output, 'vss');
+    if ~exist(vssRoot, 'dir'), mkdir(vssRoot); end
+    
+    globalTableDir = fullfile(config.paths.output, 'tables');
+    if ~exist(globalTableDir, 'dir'), mkdir(globalTableDir); end
 
-        % only max saturation trials
-        U_high = subset_unit_to_max_saturation(U, 1.0);
-        if ~isfield(U_high,'nTrials') || U_high.nTrials == 0
+    % --- 5. SESSION LOOP ---
+    for d = 1:numel(DATES)
+        % DATES{d} might be '250513' or 'Jacomo_250513'
+        % We need to resolve the exact folder name on disk
+        targetDateStr = char(DATES{d});
+        
+        % Helper to find the actual folder name (e.g. transforms '250513' -> 'Jacomo_250513')
+        sessionFolderName = resolve_session_folder(config.paths.base, targetDateStr);
+        
+        if isempty(sessionFolderName)
+            warning('Folder for %s not found in %s. Skipping.', targetDateStr, config.paths.base);
             continue;
         end
+        
+        fprintf('\n=== VSS Peak Model Analysis: %s ===\n', sessionFolderName);
+        
+        % ---------------- PATH SETUP ----------------
+        % 1. Central Output Path: output/vss/<SessionFolder>/tables
+        vssSessDir = fullfile(vssRoot, sessionFolderName);
+        vssTables  = fullfile(vssSessDir, 'tables');
+        vssMats    = fullfile(vssSessDir, 'units');
+        
+        if ~exist(vssSessDir, 'dir'), mkdir(vssSessDir); end
+        if ~exist(vssTables, 'dir'),  mkdir(vssTables);  end
+        if DO_SAVE_UNIT_MATS && ~exist(vssMats, 'dir'), mkdir(vssMats); end
+        
+        % 2. Local Session Path: data/<SessionFolder>/tables/vss
+        localSessDir   = fullfile(config.paths.base, sessionFolderName);
+        localTablesDir = fullfile(localSessDir, 'tables', 'vss');
+        if ~exist(localTablesDir, 'dir'), mkdir(localTablesDir); end
+        % --------------------------------------------
 
-        hm = compute_hue_means(U_high);
-        P  = peak_model_harmonic(U_high, config);   % <-- fit-based classifier
-        FT = fourier_analysis(U_high, config);      % descriptive only
-
-        dateStrStr   = string(U_high.dateStr);
-        unitTypeStr  = string(U_high.unitType);
-        unitIDVal    = U_high.unitID;
-        unitLabelStr = unitTypeStr + string(unitIDVal);
-
-        isTunedFit = isfield(P,'p_tuned') && ~isnan(P.p_tuned) && (P.p_tuned < alpha);
-
-        if P.class == "unimodal"
-            kMax_fit = 1;
-        elseif P.class == "bimodal"
-            kMax_fit = 2;
-        else
-            kMax_fit = NaN;
-        end
-
-        fracMax_fit = NaN;
-
-        % -------- hue mean table --------
-        nH = numel(hm.hues);
-        if nH > 0
-            meanRows = [meanRows; table( ...
-                repmat(dateStrStr,nH,1), repmat(unitTypeStr,nH,1), repmat(unitIDVal,nH,1), ...
-                repmat(unitLabelStr,nH,1), hm.hues(:), hm.rate_mean(:), hm.rate_sem(:), hm.n_trials(:), ...
-                'VariableNames', {'dateStr','unitType','unitID','unitLabel','hueID','rate_mean','rate_sem','n_trials'})];
-        end
-
-        % -------- peak model table --------
-        peakRow = table(dateStrStr,unitTypeStr,unitIDVal,unitLabelStr,...
-            string(P.class),string(P.class),isTunedFit,kMax_fit,fracMax_fit,...
-            P.amp1,P.amp2,P.amp_ratio,numel(hm.hues),U_high.nTrials,...
-            'VariableNames',{'dateStr','unitType','unitID','unitLabel','peakClass','peakClass_orig',...
-            'isTunedFit','kMax_fit','fracMax_fit','amp1','amp2','amp_ratio','nHues','nTrials'});
-
-       if isfield(P,'R2')
-        peakRow.R2 = P.R2;
-        else
-            peakRow.R2 = NaN;
+        % Load Session (Use the folder name or date string)
+        try
+            S = load_session(sessionFolderName, config);
+        catch ME
+            warning('Could not load session %s: %s', sessionFolderName, ME.message);
+            continue;
         end
         
-        if isfield(P,'p_tuned')
-            peakRow.p_tuned = P.p_tuned;
-        else
-            peakRow.p_tuned = NaN;
+        S = filter_zero_spike_units(S, config);
+        T = make_trial_index_table(S, COL, config); 
+        
+        peakRows = table();
+        meanRows = table();
+        
+        alpha = 0.05;
+        if isfield(config,'tuning') && isfield(config.tuning,'alphaHarmonic')
+            alpha = config.tuning.alphaHarmonic;
         end
         
-        if isfield(P,'p_bimodal')
-            peakRow.p_bimodal = P.p_bimodal;
-        else
-            peakRow.p_bimodal = NaN;
+        % --- UNIT LOOP ---
+        for unitIdx = 1:S.nUnits
+            if unitIdx > numel(S.unitIDs), break; end
+            uID = S.unitIDs(unitIdx);
+            
+            if isfield(S, 'unitTypes') && numel(S.unitTypes) >= unitIdx
+                uType = S.unitTypes{unitIdx};
+            else
+                uType = '?';
+            end
+            
+            fprintf('  Processing Unit %d/%d (ID=%d %s)...\n', unitIdx, S.nUnits, uID, uType);
+            
+            U = struct();
+            U.dateStr  = sessionFolderName; % Ensure we use the full folder name
+            U.unitID   = uID;
+            U.unitType = uType;
+            U.spk      = S.spk{unitIdx}; 
+            U.trials   = T;              
+            U.nTrials  = height(T);
+            
+            if isfield(config,'window') && isfield(config.window,'early')
+                U.winEarly = config.window.early;
+            else
+                U.winEarly = [0.05 0.25]; 
+            end
+
+            if DO_DROP_OUTLIERS
+                U = detect_outliers(U, config);
+            end
+            
+            U_high = subset_unit_to_max_saturation(U, 1.0);
+            
+            if ~isfield(U_high,'nTrials') || U_high.nTrials < 10
+                continue; 
+            end
+            
+            hm = compute_hue_means(U_high);      
+            P  = peak_model_harmonic(U_high, config); 
+            
+            dateStrStr   = string(sessionFolderName);
+            unitTypeStr  = string(U.unitType);
+            unitIDVal    = U.unitID;
+            unitLabelStr = unitTypeStr + string(unitIDVal);
+            
+            isTunedFit = isfield(P,'p_tuned') && ~isnan(P.p_tuned) && (P.p_tuned < alpha);
+            
+            if P.class == "unimodal"
+                kMax_fit = 1;
+            elseif P.class == "bimodal"
+                kMax_fit = 2;
+            else
+                kMax_fit = NaN;
+            end
+            fracMax_fit = NaN; 
+            
+            nH = numel(hm.hues);
+            if nH > 0
+                newMean = table( ...
+                    repmat(dateStrStr,nH,1), repmat(unitTypeStr,nH,1), repmat(unitIDVal,nH,1), ...
+                    repmat(unitLabelStr,nH,1), hm.hues(:), hm.rate_mean(:), hm.rate_sem(:), hm.n_trials(:), ...
+                    'VariableNames', {'dateStr','unitType','unitID','unitLabel','hueID','rate_mean','rate_sem','n_trials'});
+                meanRows = [meanRows; newMean];
+            end
+            
+            peakRow = table(dateStrStr, unitTypeStr, unitIDVal, unitLabelStr, ...
+                string(P.class), string(P.class), isTunedFit, kMax_fit, fracMax_fit, ...
+                P.amp1, P.amp2, P.amp_ratio, nH, U_high.nTrials, ...
+                'VariableNames',{'dateStr','unitType','unitID','unitLabel','peakClass','peakClass_orig',...
+                'isTunedFit','kMax_fit','fracMax_fit','amp1','amp2','amp_ratio','nHues','nTrials'});
+            
+            if isfield(P,'R2'), peakRow.R2 = P.R2; else, peakRow.R2 = NaN; end
+            if isfield(P,'p_tuned'), peakRow.p_tuned = P.p_tuned; else, peakRow.p_tuned = NaN; end
+            if isfield(P,'p_bimodal'), peakRow.p_bimodal = P.p_bimodal; else, peakRow.p_bimodal = NaN; end
+            
+            peakRows = [peakRows; peakRow];
+            
+            if DO_SAVE_UNIT_MATS
+                saveName = fullfile(vssMats, sprintf('%s_%s%d_VSS_Peak.mat', sessionFolderName, U.unitType, U.unitID));
+                save(saveName, 'U_high', 'hm', 'P');
+            end
+            
+            isKeep = ismember(P.class, ["unimodal","bimodal"]);
+            if DO_BUILD_KEEP_LIST && isKeep
+                allKeepRows = [allKeepRows; table( ...
+                    dateStrStr, unitLabelStr, 1, string(P.class), unitTypeStr, unitIDVal, ...
+                    'VariableNames', {'session','unit','keep','peakClass','unitType','unitID'})];
+            end
         end
-
-        peakRows = [peakRows; peakRow];
-
-        if DO_SAVE_UNIT_MATS
-            save_vss_unit(config, U_high, hm, P);
+        
+        % --- SAVE SESSION TABLES ---
+        meanName = sprintf('%s_vss_hueMeans_sat1.csv', sessionFolderName);
+        peakName = sprintf('%s_vss_peakModel_sat1.csv', sessionFolderName);
+        
+        if ~isempty(meanRows)
+            writetable(meanRows, fullfile(vssTables, meanName));
+            writetable(meanRows, fullfile(localTablesDir, meanName)); 
         end
-
-     % --- decide if this unit qualifies for the global keep list ---
-isKeep = ismember(P.class, ["unimodal","bimodal"]);
-
-if DO_BUILD_KEEP_LIST && isKeep
-    allKeepRows = [allKeepRows; table( ...
-        dateStrStr, unitLabelStr, 1, string(P.class), unitTypeStr, unitIDVal, ...
-        'VariableNames', {'session','unit','keep','peakClass','unitType','unitID'})];
-end
-
-
+        if ~isempty(peakRows)
+            writetable(peakRows, fullfile(vssTables, peakName));
+            writetable(peakRows, fullfile(localTablesDir, peakName)); 
+        end
+        
+        fprintf('  > Saved session tables to: %s\n', vssTables);
+        fprintf('  > Saved local copies to:   %s\n', localTablesDir);
     end
-
-    % --- write per-session tables under /vss/<date>/tables ---
-    if ~isempty(meanRows)
-        writetable(meanRows, fullfile(vssTables, sprintf('%s_vss_hueMeans_sat1.csv', dateStr)));
-    end
-    if ~isempty(peakRows)
-        writetable(peakRows, fullfile(vssTables, sprintf('%s_vss_peakModel_sat1.csv', dateStr)));
-    end
-    if ~isempty(fourRows)
-        writetable(fourRows, fullfile(vssTables, sprintf('%s_vss_fourier_sat1.csv', dateStr)));
+    
+    % --- 6. SAVE GLOBAL KEEP LIST ---
+    if DO_BUILD_KEEP_LIST && ~isempty(allKeepRows)
+        keepFile = fullfile(globalTableDir, 'ALL_keep_vss.csv');
+        writetable(allKeepRows, keepFile);
+        fprintf('\n✅ Wrote Global VSS Keep List to: %s\n', keepFile);
+        fprintf('   Total units kept: %d\n', height(allKeepRows));
     end
 end
 
-% --- global keeper ---
-if DO_BUILD_KEEP_LIST && ~isempty(allKeepRows)
-    keepFile = fullfile(config.paths.base, 'ALL_keep_vss.csv');
-    writetable(allKeepRows, keepFile);
-    fprintf('✅ Wrote global keep list to %s (%d units kept)\n', keepFile, height(allKeepRows));
+% -------------------------------------------------------------------------
+% LOCAL HELPERS
+% -------------------------------------------------------------------------
+
+function actualName = resolve_session_folder(basePath, inputStr)
+    % Finds the actual folder name matching the input string (date or full name).
+    % e.g. input '250513' -> returns 'Jacomo_250513'
+    
+    actualName = '';
+    
+    % 1. Check if inputStr is already a valid folder
+    if exist(fullfile(basePath, inputStr), 'dir')
+        actualName = inputStr;
+        return;
+    end
+    
+    % 2. If it looks like a date (6 digits), search for *Date*
+    if regexp(inputStr, '^\d{6}$')
+        d = dir(fullfile(basePath, ['*' inputStr '*']));
+        isDir = [d.isdir] & ~ismember({d.name}, {'.','..'});
+        matches = d(isDir);
+        
+        if ~isempty(matches)
+            % If multiple match, prefer one that starts with a name? 
+            % For now, take the first one (or the longest one).
+            actualName = matches(1).name;
+        end
+    end
 end
 
+function U_out = subset_unit_to_max_saturation(U, maxSatVal)
+    U_out = U;
+    if ~isfield(U,'trials'), U_out.nTrials=0; return; end
+    
+    if ismember('satID', U.trials.Properties.VariableNames)
+        satCol = U.trials.satID;
+    elseif ismember('satVal', U.trials.Properties.VariableNames)
+        satCol = U.trials.satVal;
+    elseif ismember('sat', U.trials.Properties.VariableNames)
+        satCol = U.trials.sat;
+    else
+        warning('Cannot find saturation column (satID/satVal) in U.trials');
+        U_out.nTrials = 0;
+        return;
+    end
+    
+    mask = abs(satCol - maxSatVal) < 0.01;
+    
+    U_out.trials = U.trials(mask, :);
+    if isfield(U,'spk') && numel(U.spk) == U.nTrials
+        U_out.spk = U.spk(mask);
+    end
+    U_out.nTrials = sum(mask);
 end
 % ===== END FILE: run_vss_peakmodels.m =====
 
@@ -1732,6 +2094,25 @@ end
 
 end
 % ===== END FILE: config/build_extended_color_metadata.m =====
+
+% ===== FILE: config/get_color_coords_table.m =====
+% ===== START =====
+function ColorTable = get_color_coords_table(config)
+    % 1. Load IDs
+    colsFile = fullfile(config.paths.code, 'DiscProbeColsUpdated.mat');
+    load(colsFile, 'ProbeColIDs'); % [Hue, Sat, Elev]
+    
+    % 2. Load Coordinates
+    lmsFile = fullfile(config.paths.code, 'lms.csv');
+    LMS_all = readmatrix(lmsFile); % [L, M, S]
+    
+    % 3. Join them (Assuming rows match 1-to-1)
+    % If they don't match, we'd use RGB matching, but usually they are aligned.
+    ColorTable = table(ProbeColIDs(:,1), ProbeColIDs(:,2), ProbeColIDs(:,3), ...
+                       LMS_all(:,1), LMS_all(:,2), LMS_all(:,3), ...
+                       'VariableNames', {'hueID','satVal','elevID','L','M','S'});
+end
+% ===== END FILE: config/get_color_coords_table.m =====
 
 % ===== FILE: config/load_color_metadata.m =====
 % ===== START =====
@@ -2940,123 +3321,6 @@ X_all = [ones(nStim,1), cos(theta), sin(theta)];
 y_cos = X_all * b;
 end
 % ===== END FILE: core/analysis/DiscProbe_STA_LMSLINv5.m =====
-
-% ===== FILE: core/analysis/anova_analysis.m =====
-% ===== START =====
-function A = anova_analysis(U, config)
-% two-way ANOVA: hue × saturation on early window rate
-
-win = U.winEarly;
-dur = diff(win);
-
-nTr = numel(U.spk);
-rate = nan(nTr,1);
-
-for tt = 1:nTr
-    spks = U.spk{tt};
-    if isempty(spks)
-        rate(tt) = 0;
-    else
-        rate(tt) = sum(spks >= win(1) & spks < win(2)) ./ dur;
-    end
-end
-
-hueID = U.trials.hueID;
-satID = U.trials.satID;
-
-hasOutliers = isfield(U, 'isOutlier') && numel(U.isOutlier) == nTr;
-
-valid = isfinite(rate) & isfinite(hueID) & isfinite(satID);
-if hasOutliers
-    valid = valid & ~U.isOutlier(:);
-end
-
-rate  = rate(valid);
-hueID = hueID(valid);
-satID = satID(valid);
-
-if numel(rate) < 10
-    A = struct();
-    A.p_hue = NaN;
-    A.p_sat = NaN;
-    A.p_int = NaN;
-    A.tbl   = {};
-    A.n     = numel(rate);
-    return;
-end
-
-[p, tbl, statsAn] = anovan(rate, {hueID, satID}, ...
-    'model', 'full', ...
-    'varnames', {'hue','sat'}, ...
-    'display', 'off');
-
-A.p_hue  = p(1);
-A.p_sat  = p(2);
-A.p_int  = p(3);
-A.tbl    = tbl;
-A.stats  = statsAn;
-A.n      = numel(rate);
-
-end
-% ===== END FILE: core/analysis/anova_analysis.m =====
-
-% ===== FILE: core/analysis/compute_hue_means.m =====
-% ===== START =====
-function stats = compute_hue_means(U)
-% mean firing per hue (early window, across all sats)
-
-hue = U.trials.hueID;
-hue(isnan(hue)) = [];
-
-hues = unique(hue);
-hues = hues(:);
-
-nH = numel(hues);
-rate_mean = nan(nH,1);
-rate_sem  = nan(nH,1);
-n_trials  = nan(nH,1);
-
-win = U.winEarly;
-dur = diff(win);
-
-hasOutliers = isfield(U, 'isOutlier') && numel(U.isOutlier) == height(U.trials);
-
-for ih = 1:nH
-    h = hues(ih);
-    use = U.trials.hueID == h;
-    if hasOutliers
-        use = use & ~U.isOutlier(:);
-    end
-
-    idx = find(use);
-    if isempty(idx)
-        continue;
-    end
-
-    r = nan(numel(idx),1);
-    for ii = 1:numel(idx)
-        t = idx(ii);
-        spks = U.spk{t};
-        if isempty(spks)
-            r(ii) = 0;
-        else
-            r(ii) = sum(spks >= win(1) & spks < win(2)) ./ dur;
-        end
-    end
-
-    rate_mean(ih) = mean(r, 'omitnan');
-    rate_sem(ih)  = std(r, 'omitnan') ./ sqrt(numel(r));
-    n_trials(ih)  = numel(r);
-end
-
-stats.hues      = hues;
-stats.rate_mean = rate_mean;
-stats.rate_sem  = rate_sem;
-stats.n_trials  = n_trials;
-stats.win       = win;
-
-end
-% ===== END FILE: core/analysis/compute_hue_means.m =====
 
 % ===== FILE: core/analysis/compute_unit_color_tuning_wachtler.m =====
 % ===== START =====
@@ -5025,6 +5289,123 @@ function pop = summarize_tuning_population(allUnitTuning, config)
 end
 % ===== END FILE: core/analysis/summarize_tuning_population.m =====
 
+% ===== FILE: core/analysis/discprobe/anova_analysis.m =====
+% ===== START =====
+function A = anova_analysis(U, config)
+% two-way ANOVA: hue × saturation on early window rate
+
+win = U.winEarly;
+dur = diff(win);
+
+nTr = numel(U.spk);
+rate = nan(nTr,1);
+
+for tt = 1:nTr
+    spks = U.spk{tt};
+    if isempty(spks)
+        rate(tt) = 0;
+    else
+        rate(tt) = sum(spks >= win(1) & spks < win(2)) ./ dur;
+    end
+end
+
+hueID = U.trials.hueID;
+satID = U.trials.satID;
+
+hasOutliers = isfield(U, 'isOutlier') && numel(U.isOutlier) == nTr;
+
+valid = isfinite(rate) & isfinite(hueID) & isfinite(satID);
+if hasOutliers
+    valid = valid & ~U.isOutlier(:);
+end
+
+rate  = rate(valid);
+hueID = hueID(valid);
+satID = satID(valid);
+
+if numel(rate) < 10
+    A = struct();
+    A.p_hue = NaN;
+    A.p_sat = NaN;
+    A.p_int = NaN;
+    A.tbl   = {};
+    A.n     = numel(rate);
+    return;
+end
+
+[p, tbl, statsAn] = anovan(rate, {hueID, satID}, ...
+    'model', 'full', ...
+    'varnames', {'hue','sat'}, ...
+    'display', 'off');
+
+A.p_hue  = p(1);
+A.p_sat  = p(2);
+A.p_int  = p(3);
+A.tbl    = tbl;
+A.stats  = statsAn;
+A.n      = numel(rate);
+
+end
+% ===== END FILE: core/analysis/discprobe/anova_analysis.m =====
+
+% ===== FILE: core/analysis/discprobe/compute_hue_means.m =====
+% ===== START =====
+function stats = compute_hue_means(U)
+% mean firing per hue (early window, across all sats)
+
+hue = U.trials.hueID;
+hue(isnan(hue)) = [];
+
+hues = unique(hue);
+hues = hues(:);
+
+nH = numel(hues);
+rate_mean = nan(nH,1);
+rate_sem  = nan(nH,1);
+n_trials  = nan(nH,1);
+
+win = U.winEarly;
+dur = diff(win);
+
+hasOutliers = isfield(U, 'isOutlier') && numel(U.isOutlier) == height(U.trials);
+
+for ih = 1:nH
+    h = hues(ih);
+    use = U.trials.hueID == h;
+    if hasOutliers
+        use = use & ~U.isOutlier(:);
+    end
+
+    idx = find(use);
+    if isempty(idx)
+        continue;
+    end
+
+    r = nan(numel(idx),1);
+    for ii = 1:numel(idx)
+        t = idx(ii);
+        spks = U.spk{t};
+        if isempty(spks)
+            r(ii) = 0;
+        else
+            r(ii) = sum(spks >= win(1) & spks < win(2)) ./ dur;
+        end
+    end
+
+    rate_mean(ih) = mean(r, 'omitnan');
+    rate_sem(ih)  = std(r, 'omitnan') ./ sqrt(numel(r));
+    n_trials(ih)  = numel(r);
+end
+
+stats.hues      = hues;
+stats.rate_mean = rate_mean;
+stats.rate_sem  = rate_sem;
+stats.n_trials  = n_trials;
+stats.win       = win;
+
+end
+% ===== END FILE: core/analysis/discprobe/compute_hue_means.m =====
+
 % ===== FILE: core/analysis/vss/calc_harmonic_fstats.m =====
 % ===== START =====
 function [F, p_val, df_num, df_den] = calc_harmonic_fstats(varExp, nHues, nParams)
@@ -5267,127 +5648,126 @@ end
 % ===== FILE: core/data_loading/load_session.m =====
 % ===== START =====
 function S = load_session(sessionID, config)
-% Load one DiscProbe session and pack spikes into S.
-% sessionID can be '250513' or 'Jacomo_250513'.
+% LOAD_SESSION - Load one DiscProbe session and pack spikes into S.
+% S.phyIDs    -> The specific Unit IDs (e.g. 13, 42)
+% S.unitTypes -> Cell array {'SU', 'MU'} matching the IDs
 
     if isstring(sessionID)
         sessionID = char(sessionID);
     end
-
-    info = parse_session_id(sessionID); %turns session id into components
-
-    % date for file search
+    info = parse_session_id(sessionID); 
+    
     dateStr = char(info.dateStr);
-
-    % monkey from folder
-    % but there is also a fall back to config.monkey for scripts that use old
-    % analysis
+    
     if strlength(info.monkey) > 0
         monkey = char(info.monkey);
     else
         monkey = config.monkey;
     end
-
+    
     PATHS = struct();
     PATHS.baseDiscProbeLocal = config.paths.base;
     PATHS.baseDiscProbesCode = config.paths.code;
     PATHS.baseOut            = config.paths.output;
-
+    
     expFile = locate_expTrialsDisc(PATHS, monkey, dateStr);
     if ~isfile(expFile)
         error('Could not find ExpTrialsDisc file for %s (got: %s)', sessionID, expFile);
     end
-
+    
     t = tic;
     raw = load(expFile);
     fprintf('Loaded %s in %.1f s.\n', expFile, toc(t));
-
-    %we're looking for ExptTrialsDisc and ExptInfo
+    
     if ~isfield(raw, 'ExptTrialsDisc') || ~isfield(raw, 'ExptInfo')
         error('Expected ExptTrialsDisc and ExptInfo in %s', expFile);
     end
-
+    
     ExptTrialsDisc = raw.ExptTrialsDisc;
     ExptInfo       = raw.ExptInfo;
-
+    
     if ~isfield(ExptInfo, 'nSU') || ~isfield(ExptInfo, 'nMU')
         error('ExptInfo is missing nSU/nMU in %s', expFile);
     end
-
-    %single units, multi units, total units
+    
     nSU  = ExptInfo.nSU;
     nMU  = ExptInfo.nMU;
     nTOT = nSU + nMU;
-
-    %total trials
+    
     nTrials = size(ExptTrialsDisc, 1);
     if nTOT <= 0 || nTrials == 0
         error('No units or no trials in %s', expFile);
     end
-
-
-    cols = 10:(9+nTOT); %theres a the cols that have spike times
+    
+    cols = 10:(9+nTOT); 
     if size(ExptTrialsDisc, 2) < max(cols)
         error('Expected at least %d columns in ExptTrialsDisc, got %d.', ...
             max(cols), size(ExptTrialsDisc,2));
     end
-
+    
     if isfield(config, 'time') && isfield(config.time, 'fullWin')
         winFull = config.time.fullWin;
     else
-        winFull = [0 0.4]; %this is the real time window
+        winFull = [0 0.4]; 
     end
-
-
-    spkCols = ExptTrialsDisc(:, cols); %spikes
-    trimfun = @(x) x(x >= winFull(1) & x <= winFull(2)); %trims to desired window
+    
+    spkCols = ExptTrialsDisc(:, cols); 
+    trimfun = @(x) x(x >= winFull(1) & x <= winFull(2)); 
     spkCols = cellfun(trimfun, spkCols, 'UniformOutput', false);
-
+    
     spk_all = cell(1, nTOT);
     mrk_all = cell(1, nTOT);
-
     mrkWin   = [winFull(1) winFull(2)]; 
-    mrk_cell = repmat({mrkWin}, nTrials, 1);  %stack of windows for rasters
-
-    for uu = 1:nTOT %for every unit
+    mrk_cell = repmat({mrkWin}, nTrials, 1); 
+    
+    for uu = 1:nTOT 
         unit_tr = spkCols(:, uu);
-        for tt = 1:nTrials %for every trial 
+        for tt = 1:nTrials 
             v = unit_tr{tt}; 
             if isempty(v)
                 unit_tr{tt} = [];
             else
-                unit_tr{tt} = double(v(:).'); %row of spikes 
+                unit_tr{tt} = double(v(:).'); 
             end
         end
-        spk_all{uu} = unit_tr; %stash spikes in unit
+        spk_all{uu} = unit_tr; 
         mrk_all{uu} = mrk_cell;
     end
-
+    
+    % --- CONSTRUCT IDs AND TYPES ---
     if isfield(ExptInfo, 'spk_ID_SU') && isfield(ExptInfo, 'spk_ID_MU')
-        unitIDs_all = [ExptInfo.spk_ID_SU(:); ExptInfo.spk_ID_MU(:)];
+        phyIDs_all = [ExptInfo.spk_ID_SU(:); ExptInfo.spk_ID_MU(:)];
     else
-        unitIDs_all = (1:nTOT).';
+        phyIDs_all = (1:nTOT).';
     end
+    
+    % Create unitTypes manually since it doesn't exist in raw file
+    unitTypes_all = [repmat({'SU'}, nSU, 1); repmat({'MU'}, nMU, 1)];
 
+    % Output Structure
     S = struct();
     S.sessionID      = info.sessionID;  
     S.dateStr        = dateStr;
     S.monkey         = monkey;
     S.expFile        = expFile;
-
     S.ExptInfo       = ExptInfo;
     S.ExptTrialsDisc = ExptTrialsDisc;
-
     S.nTrials        = nTrials;
     S.nUnits         = nTOT;
-
     S.spk            = spk_all;
     S.mrk            = mrk_all;
-
-    S.phyIDs        = unitIDs_all;
-    S.trNum        = (1:nTrials).';
+    
+    % Use phyIDs as the main identifier
+    S.phyIDs         = phyIDs_all;    
+    
+    % Keep unitIDs as a copy for compatibility
+    S.unitIDs        = phyIDs_all;    
+    
+    % Crucial: Add unitTypes so downstream scripts don't fail
+    S.unitTypes      = unitTypes_all;  
+    
+    S.trNum          = (1:nTrials).';
 end
-
 % ===== END FILE: core/data_loading/load_session.m =====
 
 % ===== FILE: core/data_loading/locate_expTrialsDisc.m =====
@@ -6388,11 +6768,11 @@ end
 % ===== FILE: core/utils/load_keep_map.m =====
 % ===== START =====
 function keepMap = load_keep_map(baseDiscProbeLocal, primaryName, fallbackName)
-% Load a keep-list CSV and return a containers.Map keyed by 'YYMMDD_unitLabel'.
+% LOAD_KEEP_MAP - Load keep-list CSV into a containers.Map
+% Key: 'Session_UnitLabel' (e.g., 'Jacomo_250513_SU1' or '250513_SU1')
+% Val: 1 (Keep) or 0 (Drop)
 %
-% baseDiscProbeLocal: root DiscProbe folder (config.paths.base).
-% primaryName:  optional, default 'ALL_keep_vss.csv'.
-% fallbackName: optional, default 'ALL_keep.csv'.
+% Auto-searches baseDiscProbeLocal AND ../output/tables if not found.
 
 if nargin < 2 || isempty(primaryName)
     primaryName = 'ALL_keep_vss.csv';
@@ -6403,81 +6783,90 @@ end
 
 keepMap = containers.Map;
 
-keepFilePrimary  = fullfile(baseDiscProbeLocal, primaryName);
-keepFileFallback = fullfile(baseDiscProbeLocal, fallbackName);
+% Define Candidate Paths
+% 1. Direct base path (data/)
+p1 = fullfile(baseDiscProbeLocal, primaryName);
+p2 = fullfile(baseDiscProbeLocal, fallbackName);
 
-if isfile(keepFilePrimary)
-    keepFile = keepFilePrimary;
-elseif isfile(keepFileFallback)
-    keepFile = keepFileFallback;
-    warning('load_keep_map:Fallback', ...
-        'Primary keep list %s not found, using fallback %s instead.', ...
-        keepFilePrimary, keepFileFallback);
+% 2. Output/Tables path (assuming standard ../output/tables structure relative to code or base)
+% Try to deduce output/tables from the base path hierarchy or common config
+% (Simple heuristic: look in sibling 'output/tables' or subfolder 'tables')
+p3 = fullfile(baseDiscProbeLocal, '..', 'output', 'tables', primaryName);
+p4 = fullfile(baseDiscProbeLocal, 'tables', primaryName);
+
+if isfile(p1)
+    keepFile = p1;
+elseif isfile(p3) % Check output folder
+    keepFile = p3;
+elseif isfile(p4)
+    keepFile = p4;
+elseif isfile(p2) % Fallback name
+    keepFile = p2;
+    warning('load_keep_map:Fallback', 'Primary keep list not found. Using fallback: %s', p2);
 else
     warning('load_keep_map:NotFound', ...
-        'No keep list found (%s or %s). Processing all units.', ...
-        keepFilePrimary, keepFileFallback);
+        'Could not find keep list (%s) in %s or standard output folders. Processing ALL units.', ...
+        primaryName, baseDiscProbeLocal);
     return;
 end
 
-fprintf('Loading keep list from %s...\n', keepFile);
-
+fprintf('Loading keep list from: %s\n', keepFile);
 T_keep = readtable(keepFile);
-
 names      = T_keep.Properties.VariableNames;
 namesLower = lower(names);
 
-% session/date column
+% --- Detect Columns ---
 sessField = '';
 for cand = {'session','date','datestr'}
     idx = find(strcmp(namesLower, cand{1}), 1);
-    if ~isempty(idx)
-        sessField = names{idx};
-        break;
-    end
+    if ~isempty(idx), sessField = names{idx}; break; end
 end
-if isempty(sessField)
-    error('Keep list %s is missing a session/date column.', keepFile);
-end
+if isempty(sessField), error('Keep list missing session/date column.'); end
 
-% unit label column
 unitField = '';
-for cand = {'unit','unit_label','unitname'}
+for cand = {'unit','unit_label','unitname','unitlabel'}
     idx = find(strcmp(namesLower, cand{1}), 1);
-    if ~isempty(idx)
-        unitField = names{idx};
-        break;
-    end
+    if ~isempty(idx), unitField = names{idx}; break; end
 end
-if isempty(unitField)
-    error('Keep list %s is missing a unit column.', keepFile);
-end
+if isempty(unitField), error('Keep list missing unit column.'); end
 
-% keep flag column (prefer VSS-specific if present)
 keepField = '';
 for cand = {'keep_vss','keep','keep_flag'}
     idx = find(strcmp(namesLower, cand{1}), 1);
-    if ~isempty(idx)
-        keepField = names{idx};
-        break;
-    end
+    if ~isempty(idx), keepField = names{idx}; break; end
 end
-if isempty(keepField)
-    error('Keep list %s is missing a keep flag column.', keepFile);
-end
+if isempty(keepField), error('Keep list missing keep flag column.'); end
 
+% --- Populate Map ---
 for i = 1:height(T_keep)
+    % 1. Parse Unit Name
     uName = string(T_keep.(unitField)(i));
-
+    
+    % 2. Parse Session String (Handle 250513 vs 'Jacomo_250513')
     sVal = T_keep.(sessField)(i);
-    if isnumeric(sVal)
+    if isnumeric(sVal) && ~isnan(sVal)
         sessStr = sprintf('%06d', sVal);
     else
         sessStr = char(string(sVal));
     end
-
+    
+    % 3. Parse Keep Value (Ensure Numeric 1/0)
+    rawKeep = T_keep.(keepField)(i);
+    if iscell(rawKeep) || isstring(rawKeep) || ischar(rawKeep)
+        % Handle "TRUE"/"FALSE" strings
+        strK = string(rawKeep);
+        if strcmpi(strK, "true") || strcmpi(strK, "1")
+            val = 1;
+        else
+            val = 0;
+        end
+    else
+        val = double(rawKeep);
+    end
+    
+    % Generate Key
     key = sprintf('%s_%s', sessStr, uName);
-    keepMap(key) = T_keep.(keepField)(i);
+    keepMap(key) = val;
 end
 end
 % ===== END FILE: core/utils/load_keep_map.m =====
@@ -7498,268 +7887,295 @@ end
 % ===== FILE: core/visualization/plot_boxplots.m =====
 % ===== START =====
 function plot_boxplots(U, stats, COL, config, outDir)
+% PLOT_BOXPLOTS - Boxplots of rate vs Hue per Saturation.
+% FIX: Uses Synthetic Color Scaling (Vivid * Sat) for accurate RGB colors.
 
-if U.nTrials == 0
-    return;
-end
-
-% early window, same as detect_outliers
-win = U.winEarly;
-dur = diff(win);
-
-nTr = numel(U.spk);
-rateEarly = nan(nTr,1);
-for tt = 1:nTr
-    spks = U.spk{tt};
-    if isempty(spks)
-        rateEarly(tt) = 0;
-    else
-        spks = spks(spks >= win(1) & spks < win(2));
-        rateEarly(tt) = numel(spks) / dur;
-    end
-end
-
-hueID = U.trials.hueID;
-satID = U.trials.satID;
-
-% defaults matching original
-USE_NORM = false;
-METHOD   = 'tukey';
-MIN_N    = 5;
-
-if isfield(config,'boxPlots')
-    bp = config.boxPlots;
-    if isfield(bp,'useNorm'), USE_NORM = logical(bp.useNorm); end
-    if isfield(bp,'method'),  METHOD   = lower(bp.method);    end
-    if isfield(bp,'minN'),    MIN_N    = bp.minN;             end
-end
-
-if isfield(COL,'nHue')
-    nHue = COL.nHue;
-else
-    nHue = max(hueID(~isnan(hueID)));
-end
-
-ZERO_HUE = 1;
-if isfield(config,'space') && isfield(config.space,'zeroHue')
-    ZERO_HUE = config.space.zeroHue;
-end
-
-% saturation list and indices per trial
-saturIDs = unique(satID(~isnan(satID)));
-saturIDs = saturIDs(:).';
-nS       = numel(saturIDs);
-
-[~, satIdx_u] = ismember(satID, saturIDs);
-hueIdx_u = hueID;
-
-% choose values and y label
-if USE_NORM
-    r = rateEarly;
-    r = r - min(r);
-    denom = max(r);
-    if denom <= 0
-        vals = zeros(size(r));
-    else
-        vals = r ./ denom;
-    end
-    ylab = 'Normalized rate (0–1)';
-else
-    vals = rateEarly;
-    ylab = 'Rate (Hz)';
-end
-
-% figure visibility toggle
-makePlots = true;
-if isfield(config,'plot') && isfield(config.plot,'makePlots')
-    makePlots = logical(config.plot.makePlots);
-end
-figVis = 'on';
-if ~makePlots
-    figVis = 'off';
-end
-
-% ---------- paths: per-unit, per-session, global ----------
-
-dateStr  = char(string(U.dateStr));
-unitType = char(string(U.unitType));
-unitID   = U.unitID;
-
-Upaths  = get_unit_paths(config, dateStr, unitType, unitID);
-unitDir = Upaths.figures;
-if ~exist(unitDir,'dir')
-    mkdir(unitDir);
-end
-
-
-% per-session boxplots dir under figs/discprobe/boxplots
-if nargin < 5 || isempty(outDir)
-    outDir = '';
-end
-sessionDir = '';
-if ~isempty(outDir)
-    sessionDir = fullfile(outDir, 'boxplots');
-    if ~exist(sessionDir,'dir')
-        mkdir(sessionDir);
-    end
-end
-
-% global "overall" dir under output/figs/discprobe/boxplots
-globalDir = '';
-if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
-        && ~isempty(config.paths.globalDiscProbeFigRoot)
-    globalDir = fullfile(config.paths.globalDiscProbeFigRoot, 'boxplots');
-    if ~exist(globalDir,'dir')
-        mkdir(globalDir);
-    end
-end
-
-% one subplot per saturation
-nPlotSat = nS;
-figBP = figure('Color','w','Visible',figVis,'Name','Hue box plots');
-TL = tiledlayout(figBP, 1, nPlotSat, 'Padding','compact','TileSpacing','compact');
-
-if isfield(U,'exptName')
-    unitLabel = sprintf('%s | Unit %d (%s) — Box plots', string(U.exptName), U.unitID, U.unitType);
-else
-    unitLabel = sprintf('%s | Unit %d (%s) — Box plots', string(U.dateStr), U.unitID, U.unitType);
-end
-sgtitle(figBP, unitLabel, 'Interpreter','none');
-
-% color table from COL.colsSatur
-cols_satur2 = [];
-if isfield(COL,'colsSatur') && ~isempty(COL.colsSatur)
-    sz = size(COL.colsSatur);                         % [nSat x nHue x 3]
-    cols_satur2 = reshape(double(COL.colsSatur), sz(1), sz(2), 3);
-end
-
-for si = 1:nPlotSat
-    ax = nexttile(TL);
-    hold(ax,'on');
-
-    sVal = saturIDs(si);
-    msk  = (satIdx_u == si) & isfinite(hueIdx_u) & isfinite(vals);
-
-    if ~any(msk)
-        title(ax, sprintf('sat=%.2f (no data)', sVal));
-        axis(ax,'off');
-        continue;
+    if U.nTrials == 0
+        return;
     end
 
-    gHue = hueIdx_u(msk);
-    x    = vals(msk);
-
-    if exist('boxchart','file')
-        % build hue-wise colors for this sat
-        if ~isempty(cols_satur2)
-            nSatCols = size(cols_satur2,1);
-            satRow   = min(si, nSatCols);
-            C = squeeze(cols_satur2(satRow,1:nHue,:));   % nHue×3
-            C = double(C);
-            if max(C(:)) > 1, C = C/255; end
-            C(~isfinite(C)) = 0;
+    % --- DATA PREP ---
+    win = U.winEarly;
+    dur = diff(win);
+    nTr = numel(U.spk);
+    rateEarly = nan(nTr,1);
+    for tt = 1:nTr
+        spks = U.spk{tt};
+        if isempty(spks)
+            rateEarly(tt) = 0;
         else
-            C = repmat([0.5 0.5 0.5], nHue, 1);
+            spks = spks(spks >= win(1) & spks < win(2));
+            rateEarly(tt) = numel(spks) / dur;
         end
+    end
 
+    hueID = U.trials.hueID;
+    satID = U.trials.satID;
+    elevID = U.trials.elevID;
+
+    % Determine Elevation (Mode) for color lookup
+    uElevs = unique(elevID(~isnan(elevID)));
+    if isempty(uElevs), currentElev = 0; else, currentElev = mode(uElevs); end
+
+    % defaults matching original
+    USE_NORM = false;
+    METHOD   = 'tukey';
+    MIN_N    = 5;
+    if isfield(config,'boxPlots')
+        bp = config.boxPlots;
+        if isfield(bp,'useNorm'), USE_NORM = logical(bp.useNorm); end
+        if isfield(bp,'method'),  METHOD   = lower(bp.method);    end
+        if isfield(bp,'minN'),    MIN_N    = bp.minN;             end
+    end
+
+    if isfield(COL,'nHue')
+        nHue = COL.nHue;
+    else
+        nHue = max(hueID(~isnan(hueID)));
+    end
+
+    ZERO_HUE = 1;
+    if isfield(config,'space') && isfield(config.space,'zeroHue')
+        ZERO_HUE = config.space.zeroHue;
+    end
+
+    % saturation list and indices per trial
+    saturIDs = unique(satID(~isnan(satID)));
+    saturIDs = saturIDs(:).';
+    nS       = numel(saturIDs);
+    [~, satIdx_u] = ismember(satID, saturIDs);
+    hueIdx_u = hueID;
+    
+    if isempty(saturIDs), maxSat = 1; else, maxSat = max(saturIDs); end
+
+    % choose values and y label
+    if USE_NORM
+        r = rateEarly;
+        r = r - min(r);
+        denom = max(r);
+        if denom <= 0
+            vals = zeros(size(r));
+        else
+            vals = r ./ denom;
+        end
+        ylab = 'Normalized rate (0–1)';
+    else
+        vals = rateEarly;
+        ylab = 'Rate (Hz)';
+    end
+
+    % figure visibility toggle
+    makePlots = true;
+    if isfield(config,'plot') && isfield(config.plot,'makePlots')
+        makePlots = logical(config.plot.makePlots);
+    end
+    figVis = 'on';
+    if ~makePlots
+        figVis = 'off';
+    end
+
+    % ---------- paths: per-unit, per-session, global ----------
+    dateStr  = char(string(U.dateStr));
+    unitType = char(string(U.unitType));
+    unitID   = U.unitID;
+
+    Upaths  = get_unit_paths(config, dateStr, unitType, unitID);
+    unitDir = Upaths.figures;
+    if ~exist(unitDir,'dir')
+        mkdir(unitDir);
+    end
+
+    % per-session boxplots dir under figs/discprobe/boxplots
+    if nargin < 5 || isempty(outDir)
+        outDir = '';
+    end
+    sessionDir = '';
+    if ~isempty(outDir)
+        sessionDir = fullfile(outDir, 'boxplots');
+        if ~exist(sessionDir,'dir')
+            mkdir(sessionDir);
+        end
+    end
+
+    % global "overall" dir under output/figs/discprobe/boxplots
+    globalDir = '';
+    if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
+            && ~isempty(config.paths.globalDiscProbeFigRoot)
+        globalDir = fullfile(config.paths.globalDiscProbeFigRoot, 'boxplots');
+        if ~exist(globalDir,'dir')
+            mkdir(globalDir);
+        end
+    end
+
+    % --- PLOTTING ---
+    nPlotSat = nS;
+    figBP = figure('Color','w','Visible',figVis,'Name','Hue box plots');
+    TL = tiledlayout(figBP, 1, nPlotSat, 'Padding','compact','TileSpacing','compact');
+
+    if isfield(U,'exptName')
+        unitLabel = sprintf('%s | Unit %d (%s) — Box plots', string(U.exptName), U.unitID, U.unitType);
+    else
+        unitLabel = sprintf('%s | Unit %d (%s) — Box plots', string(U.dateStr), U.unitID, U.unitType);
+    end
+    sgtitle(figBP, unitLabel, 'Interpreter','none');
+
+    for si = 1:nPlotSat
+        ax = nexttile(TL);
+        hold(ax,'on');
+        sVal = saturIDs(si);
+        
+        msk  = (satIdx_u == si) & isfinite(hueIdx_u) & isfinite(vals);
+        if ~any(msk)
+            title(ax, sprintf('sat=%.2f (no data)', sVal));
+            axis(ax,'off');
+            continue;
+        end
+        
+        gHue = hueIdx_u(msk);
+        x    = vals(msk);
+        
+        % --- FIX: CALCULATE COLORS DYNAMICALLY ---
+        % Generate color matrix for this specific saturation (nHue x 3)
+        C = zeros(nHue, 3);
         for h = 1:nHue
-            j = find(msk & hueIdx_u == h);
-            if isempty(j), continue; end
-
-            b = boxchart(hueIdx_u(j), vals(j), 'Parent', ax, ...
-                'MarkerStyle','.', 'BoxFaceAlpha',0.6);
-
-            rgb = C(h,:);
-            rgb = min(max(rgb,0),1);
-            b.BoxFaceColor = rgb;
-            b.BoxEdgeColor = rgb;
-            b.MarkerColor  = rgb;
+            C(h, :) = get_synthetic_color(COL, h, sVal, maxSat, currentElev);
         end
+        
+        if exist('boxchart','file')
+            % Modern MATLAB boxchart
+            for h = 1:nHue
+                j = find(msk & hueIdx_u == h);
+                if isempty(j), continue; end
+                
+                b = boxchart(hueIdx_u(j), vals(j), 'Parent', ax, ...
+                    'MarkerStyle','.', 'BoxFaceAlpha',0.6);
+                
+                rgb = C(h,:);
+                rgb = min(max(rgb,0),1);
+                
+                b.BoxFaceColor = rgb;
+                b.BoxEdgeColor = rgb;
+                b.MarkerColor  = rgb;
+            end
+        else
+            % Fallback for older MATLAB
+            [~,~,grp] = unique(gHue);
+            boxplot(ax, x, grp, 'Symbol','.', 'Colors', C(1:max(grp),:));
+            set(ax,'XTick',1:nHue,'XLim',[0.5 nHue+0.5]);
+        end
+        
+        title(ax, sprintf('sat=%.2f', sVal));
+        xlabel(ax,'Hue');
+        ylabel(ax, ylab);
+        
+        % label x-axis as degrees if DKL
+        if isfield(config,'space') && isfield(config.space,'mode') && strcmpi(config.space.mode,'dkl')
+            degLabels = mod((1:nHue) - ZERO_HUE, nHue) * (360/nHue);
+            set(ax,'XTick',1:nHue,'XTickLabel', ...
+                arrayfun(@(d)sprintf('%d',round(d)),degLabels,'UniformOutput',false));
+            xlabel(ax,'Angle (deg)');
+        else
+            set(ax,'XTick',1:nHue);
+        end
+        
+        ax.XLim = [0.5, nHue+0.5];
+        if USE_NORM, ylim(ax,[0 1]); end
+        grid(ax,'on');
+        
+        % outliers overlay
+        if isfield(U,'isOutlier') && numel(U.isOutlier) == nTr
+            out_msk = U.isOutlier & msk;
+            if any(out_msk)
+                plot(ax, hueIdx_u(out_msk), vals(out_msk), 'ro', 'MarkerSize',5, 'LineWidth',1.2);
+            end
+        end
+    end
+
+    pngDpi = 200;
+    if isfield(config,'plot') && isfield(config.plot,'dpi')
+        pngDpi = config.plot.dpi;
+    end
+    
+    fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
+    
+    % per-unit saves
+    pngName_unit = fullfile(unitDir, sprintf('BoxPlots_%s.png', fileTag));
+    figName_unit = fullfile(unitDir, sprintf('BoxPlots_%s.fig', fileTag));
+    exportgraphics(figBP, pngName_unit, 'Resolution', pngDpi);
+    savefig(figBP, figName_unit);
+    
+    % per-session saves
+    if ~isempty(sessionDir)
+        pngName_sess = fullfile(sessionDir, sprintf('BoxPlots_%s.png', fileTag));
+        figName_sess = fullfile(sessionDir, sprintf('BoxPlots_%s.fig', fileTag));
+        exportgraphics(figBP, pngName_sess, 'Resolution', pngDpi);
+        savefig(figBP, figName_sess);
+    end
+    
+    % global / overall saves
+    if ~isempty(globalDir)
+        pngName_glob = fullfile(globalDir, sprintf('BoxPlots_%s.png', fileTag));
+        figName_glob = fullfile(globalDir, sprintf('BoxPlots_%s.fig', fileTag));
+        exportgraphics(figBP, pngName_glob, 'Resolution', pngDpi);
+        savefig(figBP, figName_glob);
+    end
+    
+    if ~makePlots
+        close(figBP);
+    end
+end
+
+% -------------------------------------------------------------------------
+% Helper: Synthetic Color Scaling (Vivid * Saturation)
+% -------------------------------------------------------------------------
+function c = get_synthetic_color(COL, h, sVal, maxSat, eVal)
+    % 1. Get Vivid Color (Max Saturation)
+    cVivid = get_vivid_color(COL, h, maxSat, eVal);
+    
+    % 2. Scale brightness by Saturation factor
+    if maxSat > 0
+        scaleFactor = sVal / maxSat;
     else
-        % fallback to boxplot with per-hue grouping
-        g = gHue;
-        C = repmat([0 0 0], nHue, 1);
-        if ~isempty(cols_satur2)
-            nSatCols = size(cols_satur2,1);
-            satRow   = min(si, nSatCols);
-            C = squeeze(cols_satur2(satRow,1:nHue,:));
-            C = double(C);
-            if max(C(:)) > 1, C = C/255; end
-            C(~isfinite(C)) = 0;
-        end
-        [~,~,grp] = unique(g);
-        boxplot(ax, x, grp, 'Symbol','.', 'Colors', C(1:max(grp),:));
-        set(ax,'XTick',1:nHue,'XLim',[0.5 nHue+0.5]);
+        scaleFactor = 0;
+    end
+    
+    c = cVivid * scaleFactor;
+end
+
+function c = get_vivid_color(COL, h, maxSat, e)
+    c = [0.5 0.5 0.5]; 
+    if ~isfield(COL, 'probeIDs') || ~isfield(COL, 'probeCols'), return; end
+    tol = 1e-4; 
+    
+    % Try strict match for Max Sat
+    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
+    
+    % Fallback to Equator
+    if isempty(idx)
+        idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1);
+    end
+    
+    % Fallback to Hue only (any elevation/sat if max sat missing)
+    if isempty(idx)
+         idx = find(abs(COL.probeIDs(:,1)-h)<tol, 1);
     end
 
-    title(ax, sprintf('sat=%.2f', sVal));
-    xlabel(ax,'Hue');
-    ylabel(ax, ylab);
-
-    % label x-axis as degrees if DKL
-    if isfield(config,'space') && isfield(config.space,'mode') && strcmpi(config.space.mode,'dkl')
-        degLabels = mod((1:nHue) - ZERO_HUE, nHue) * (360/nHue);
-        set(ax,'XTick',1:nHue,'XTickLabel', ...
-            arrayfun(@(d)sprintf('%d',round(d)),degLabels,'UniformOutput',false));
-        xlabel(ax,'Angle (deg)');
-    else
-        set(ax,'XTick',1:nHue);
+    if ~isempty(idx)
+        rawC = double(COL.probeCols(idx,:));
+        if max(rawC) > 1, rawC = rawC / 255; end
+        c = rawC;
     end
-
-    ax.XLim = [0.5, nHue+0.5];
-    if USE_NORM, ylim(ax,[0 1]); end
-    grid(ax,'on');
-
-    % outliers overlay
-    if isfield(U,'isOutlier') && numel(U.isOutlier) == nTr
-        out_msk = U.isOutlier & msk;
-        if any(out_msk)
-            plot(ax, hueIdx_u(out_msk), vals(out_msk), 'ro', 'MarkerSize',5, 'LineWidth',1.2);
-        end
-    end
-end
-
-pngDpi = 200;
-if isfield(config,'plot') && isfield(config.plot,'dpi')
-    pngDpi = config.plot.dpi;
-end
-
-fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
-
-% per-unit saves
-pngName_unit = fullfile(unitDir, sprintf('BoxPlots_%s.png', fileTag));
-figName_unit = fullfile(unitDir, sprintf('BoxPlots_%s.fig', fileTag));
-exportgraphics(figBP, pngName_unit, 'Resolution', pngDpi);
-savefig(figBP, figName_unit);
-
-% per-session saves (if sessionDir defined)
-if ~isempty(sessionDir)
-    pngName_sess = fullfile(sessionDir, sprintf('BoxPlots_%s.png', fileTag));
-    figName_sess = fullfile(sessionDir, sprintf('BoxPlots_%s.fig', fileTag));
-    exportgraphics(figBP, pngName_sess, 'Resolution', pngDpi);
-    savefig(figBP, figName_sess);
-end
-
-% global / overall saves (if globalDir defined)
-if ~isempty(globalDir)
-    pngName_glob = fullfile(globalDir, sprintf('BoxPlots_%s.png', fileTag));
-    figName_glob = fullfile(globalDir, sprintf('BoxPlots_%s.fig', fileTag));
-    exportgraphics(figBP, pngName_glob, 'Resolution', pngDpi);
-    savefig(figBP, figName_glob);
-end
-
-if ~makePlots
-    close(figBP);
-end
-
 end
 % ===== END FILE: core/visualization/plot_boxplots.m =====
 
 % ===== FILE: core/visualization/plot_dkl_suite.m =====
 % ===== START =====
 function plot_dkl_suite(U, stats, COL, config, outDir)
-% PLOT_DKL_SUITE - 3D/2D visualization of tuning in DKL space.
-% Compatible with sphere_slicer (Robust Lookup + Flat Saving).
+% PLOT_DKL_SUITE - Polar visualization of tuning in DKL space.
+% FINAL FIXES:
+% 1. Zero Alignment: Uses config.space.zeroHue to set which Hue is at 0°.
+% 2. Spacing: Pushes Labels OUTSIDE the Hue Ring.
+% 3. Cleanliness: Removes redundant subplot title.
 
     if U.nTrials == 0
         return;
@@ -7792,7 +8208,6 @@ function plot_dkl_suite(U, stats, COL, config, outDir)
     unitDir = Upaths.figures;
     if ~exist(unitDir,'dir'), mkdir(unitDir); end
 
-    % Session Dir (Smart Flat Saving)
     if nargin < 5 || isempty(outDir), outDir = ''; end
     sessionDir = '';
     if ~isempty(outDir)
@@ -7808,7 +8223,6 @@ function plot_dkl_suite(U, stats, COL, config, outDir)
         if ~exist(sessionDir,'dir'), mkdir(sessionDir); end
     end
 
-    % Global Dir
     globalDir = '';
     if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
             && ~isempty(config.paths.globalDiscProbeFigRoot)
@@ -7816,7 +8230,7 @@ function plot_dkl_suite(U, stats, COL, config, outDir)
         if ~exist(globalDir,'dir'), mkdir(globalDir); end
     end
 
-    % --- DATA AGGREGATION ---
+    % --- DATA PREP ---
     win = U.winEarly;
     dur = diff(win);
     
@@ -7834,87 +8248,121 @@ function plot_dkl_suite(U, stats, COL, config, outDir)
     
     hueID = U.trials.hueID; satID = U.trials.satID; elevID = U.trials.elevID;
     
-    uH = unique(hueID(~isnan(hueID)));
+    if isfield(COL, 'nHue')
+        nHue = COL.nHue;
+    else
+        nHue = max(hueID(~isnan(hueID)));
+    end
+    
     uS = unique(satID(~isnan(satID)));
     uE = unique(elevID(~isnan(elevID)));
     if isempty(uE), defE = 0; else, defE = mode(uE); end
+    if isempty(uS), maxS = 1; else, maxS = max(uS); end
 
-    X = []; Y = []; Z = []; R = []; C = [];
-    r_per_hue = zeros(numel(uH), 1); 
+    % --- ROTATION FIX: Handle Zero Hue ---
+    ZERO_HUE = 1; % Default
+    if isfield(config, 'space') && isfield(config.space, 'zeroHue')
+        ZERO_HUE = config.space.zeroHue;
+    end
+
+    hue_indices = (1:nHue)';
     
-    for hi = 1:numel(uH)
-        hVal = uH(hi);
-        hueRates = [];
-        for si = 1:numel(uS)
-            sVal = uS(si);
-            mask = (hueID == hVal) & (satID == sVal);
-            if nnz(mask) == 0, continue; end
-            
-            meanR = mean(rates(mask), 'omitnan');
-            hueRates = [hueRates; meanR]; %#ok<AGROW>
-            
-            % Robust Lookup
-            [dklCoords, rgbColor] = get_coords_from_meta(COL, hVal, sVal, defE);
-            if all(isnan(dklCoords)), continue; end
-            
-            X = [X; dklCoords(1)]; %#ok<AGROW>
-            Y = [Y; dklCoords(2)]; %#ok<AGROW>
-            Z = [Z; dklCoords(3)]; %#ok<AGROW>
-            R = [R; meanR];        %#ok<AGROW>
-            C = [C; rgbColor];     %#ok<AGROW>
+    % Calculate Angle relative to Zero Hue
+    % mod(h - zero, n) ensures correct rotation
+    % e.g. if Zero=16, Hue 16 becomes 0 deg, Hue 1 becomes 22.5 deg
+    hue_angles = 2*pi * mod(hue_indices - ZERO_HUE, nHue) / nHue;
+    
+    r_per_hue = zeros(nHue, 1);
+    for hVal = 1:nHue
+        mask = (hueID == hVal);
+        if nnz(mask) > 0
+            r_per_hue(hVal) = mean(rates(mask), 'omitnan');
+        else
+            r_per_hue(hVal) = 0;
         end
-        if ~isempty(hueRates), r_per_hue(hi) = mean(hueRates); end
     end
     
-    if isempty(R), return; end
-    C = min(max(C,0),1);
-    
-    % --- PROJECTION ---
-    coords = [X, Y, Z];
-    stds   = std(coords, 0, 1);
-    [~, minDim] = min(stds); 
-    dims = setdiff(1:3, minDim);
-    ixX = dims(1); ixY = dims(2);
-    XY = coords(:, [ixX, ixY]);
-
     % --- PLOTTING ---
     f = figure('Color','w','Visible',figVis,'Name','DKL suite');
-    f.Units = 'normalized'; f.Position = [0.1 0.1 0.75 0.7];
-    tlo = tiledlayout(f,1,2,'TileSpacing','compact','Padding','compact');
-
-    % 3D Bars
-    ax3d = nexttile(tlo,1);
-    hold(ax3d,'on'); grid(ax3d,'on'); axis(ax3d,'equal');
-    rPos = max(R,0); maxR = max(rPos); if maxR <= 0, rPos(:) = 0; end
-    baseRadius = 0.05 * (max(XY(:)) - min(XY(:)));
-    if baseRadius == 0, baseRadius = 0.05; end
+    f.Units = 'normalized'; f.Position = [0.2 0.2 0.5 0.75]; 
     
-    for k = 1:numel(rPos)
-        if rPos(k) <= 0, continue; end
-        x0 = XY(k,1); y0 = XY(k,2); z0 = 0; h = rPos(k); w = baseRadius;
-        xv = [x0-w x0+w x0+w x0-w]; yv = [y0-w y0-w y0+w y0+w];
-        zv = [z0   z0   z0   z0];   zt = zv + h;
-        fc = C(k,:);
-        patch(ax3d, xv, yv, zt, fc, 'FaceAlpha',0.9, 'EdgeColor','none');
+    axP = polaraxes('Parent', f);
+    hold(axP, 'on');
+    
+    % 1. ORIENTATION
+    axP.ThetaZeroLocation = 'right';
+    axP.ThetaDir = 'counterclockwise';
+    axP.FontSize = 10; 
+    
+    % Sort by angle for proper line drawing
+    [sortedAngles, sortIdx] = sort(hue_angles);
+    sortedRates = r_per_hue(sortIdx);
+    sortedHues  = hue_indices(sortIdx);
+    
+    % Close loop
+    if ~isempty(sortedAngles)
+        sortedAngles(end+1) = sortedAngles(1) + 2*pi;
+        sortedRates(end+1)  = sortedRates(1);
     end
-    xlabel(ax3d, sprintf('DKL Axis %d', ixX)); ylabel(ax3d, sprintf('DKL Axis %d', ixY));
-    zlabel(ax3d, 'Rate (Hz)'); title(ax3d, 'Response in DKL Plane'); view(ax3d, [40 25]);
+    
+    % --- SCALING LAYERS ---
+    maxRate = max(sortedRates, [], 'omitnan');
+    if maxRate <= 0, maxRate = 1; end
+    
+    ringCenter  = maxRate * 1.15;  
+    viewLimit   = maxRate * 1.25;  
+    labelRadius = maxRate * 1.55; 
+    
+    rlim(axP, [0 viewLimit]);
+    
+    % 2. Draw Tuning Curve (Red)
+    polarplot(axP, sortedAngles, sortedRates, 'o-', ...
+        'LineWidth', 2.5, 'Color', 'r', 'MarkerFaceColor', 'r', 'MarkerSize', 5);
+    
+    % 3. Draw Colored Ring (Flush with edge)
+    hueWidth = 2*pi / nHue;
+    
+    for k = 1:nHue
+        % Use sorted indices to match the angles
+        hVal = sortedHues(k);
+        thisAngle = sortedAngles(k);
+        
+        [~, ringC] = get_coords_from_meta(COL, hVal, maxS, defE);
+        
+        thStart = thisAngle - hueWidth/2 * 0.98;
+        thEnd   = thisAngle + hueWidth/2 * 0.98;
+        thArc   = linspace(thStart, thEnd, 20); 
+        rArc    = repmat(ringCenter, size(thArc));
+        
+        polarplot(axP, thArc, rArc, '-', 'Color', ringC, 'LineWidth', 20); 
+    end
+    
+    % 4. Preferred Direction
+    if ~isempty(r_per_hue)
+        % Calculate vector sum using original angles
+        V = sum(r_per_hue .* exp(1i * hue_angles));
+        prefAng = angle(V);
+        polarplot(axP, [0, prefAng], [0, maxRate], '--', ...
+            'Color', [0.9 0.7 0], 'LineWidth', 2);
+    end
+    
+    % 5. DKL Labels (Outside everything)
+    fontSz = 11;
+    text(axP, 0,    labelRadius, '+[L-M]', 'HorizontalAlignment','center', 'FontWeight','bold', 'FontSize', fontSz, 'Clipping', 'off');
+    text(axP, pi/2, labelRadius, '+S',     'HorizontalAlignment','center', 'FontWeight','bold', 'FontSize', fontSz, 'Clipping', 'off');
+    text(axP, pi,   labelRadius, '-[L-M]', 'HorizontalAlignment','center', 'FontWeight','bold', 'FontSize', fontSz, 'Clipping', 'off');
+    text(axP, 3*pi/2, labelRadius, '-S',   'HorizontalAlignment','center', 'FontWeight','bold', 'FontSize', fontSz, 'Clipping', 'off');
 
-    % 2D Summary
-    ax2d = nexttile(tlo,2); hold(ax2d,'on'); grid(ax2d,'on');
-    plot(ax2d, 1:numel(uH), r_per_hue, 'o-', 'LineWidth', 1.5, 'Color', 'k');
-    xlim(ax2d, [0.5 numel(uH)+0.5]);
-    xlabel(ax2d, 'Hue Index'); ylabel(ax2d, 'Mean Rate (Hz)'); title(ax2d, 'Marginal Hue Tuning');
-
-    % Title Handling (Replaced dash with standard hyphen)
+    % --- TITLE & SAVING ---
     if isfield(U,'exptName')
-        ttl = sprintf('%s | Unit %d (%s) - DKL suite', string(U.exptName), U.unitID, U.unitType);
+        ttl = sprintf('%s | Unit %d (%s) - DKL Polar', string(U.exptName), U.unitID, U.unitType);
     else
-        ttl = sprintf('%s | Unit %d (%s) - DKL suite', string(U.dateStr), U.unitID, U.unitType);
+        ttl = sprintf('%s | Unit %d (%s) - DKL Polar', string(U.dateStr), U.unitID, U.unitType);
     end
-    sgtitle(f, ttl, 'Interpreter','none');
+    
+    % Safe title positioning (axes title with newlines)
+    title(axP, {ttl, ''}, 'Interpreter','none', 'FontSize', 12, 'FontWeight', 'bold');
 
-    % --- SAVING ---
     fileTag = sprintf('%s_%s_%d', string(U.dateStr), U.unitType, U.unitID);
     exportgraphics(f, fullfile(unitDir, sprintf('DKL_suite_%s.png', fileTag)), 'Resolution', pngDpi);
     if doSaveFig, savefig(f, fullfile(unitDir, sprintf('DKL_suite_%s.fig', fileTag))); end
@@ -7938,6 +8386,16 @@ function [dkl, rgb] = get_coords_from_meta(COL, h, s, e)
     if ~isfield(COL, 'probeIDs') || ~isfield(COL, 'dklRows'), return; end
     tol = 1e-4;
     idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
+    
+    % Fallback 1: Ignore Elev
+    if isempty(idx)
+         idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol, 1);
+    end
+    % Fallback 2: Any Hue match (useful for Vivid lookup)
+    if isempty(idx)
+        idx = find(abs(COL.probeIDs(:,1)-h)<tol, 1);
+    end
+    
     if ~isempty(idx)
         dkl = double(COL.dklRows(idx, :));
         if isfield(COL, 'probeCols'), rawC = double(COL.probeCols(idx, :)); if max(rawC)>1, rawC=rawC/255; end; rgb=rawC; end
@@ -8581,19 +9039,22 @@ end
 % ===== FILE: core/visualization/plot_rayleigh.m =====
 % ===== START =====
 function plot_rayleigh(U, stats, COL, config, outDir)
-% PLOT_RAYLEIGH - Polar tuning plots (Overall + Per Saturation).
-% UPDATES: Flexible layout, Robust Color Lookup (Trials > Meta > Fallback).
+% PLOT_RAYLEIGH - Polar tuning plots.
+% UPDATES:
+% 1. Orientation: 0° Right, 90° Top (Counter-Clockwise).
+% 2. Alignment: Angles calculated relative to config.space.zeroHue.
+% 3. Cleanliness: Axis lines and grids are hidden (only data shown).
 
     if U.nTrials == 0
         return;
     end
     
-    % Check stats (optional)
+    % Check stats
     if ~isfield(stats, 'rayleigh') || isempty(stats.rayleigh)
         % proceed anyway
     end
     
-    % --- CONFIGURATION ---
+    % --- CONFIG ---
     makePlots = true;
     if isfield(config, 'plot') && isfield(config.plot, 'makePlots')
         makePlots = logical(config.plot.makePlots);
@@ -8611,7 +9072,7 @@ function plot_rayleigh(U, stats, COL, config, outDir)
         doSaveFig = config.plot.saveFigs;
     end
     
-    % ---------- Paths ----------
+    % --- PATHS ---
     dateStr  = char(string(U.dateStr));
     unitType = char(string(U.unitType));
     unitID   = U.unitID;
@@ -8620,7 +9081,6 @@ function plot_rayleigh(U, stats, COL, config, outDir)
     unitDir = Upaths.figures;
     if ~exist(unitDir,'dir'), mkdir(unitDir); end
     
-    % Session Dir
     if nargin < 5 || isempty(outDir), outDir = ''; end
     sessionDir = '';
     if ~isempty(outDir)
@@ -8636,7 +9096,6 @@ function plot_rayleigh(U, stats, COL, config, outDir)
         if ~exist(sessionDir,'dir'), mkdir(sessionDir); end
     end
     
-    % Global Dir
     globalDir = '';
     if isfield(config,'paths') && isfield(config.paths,'globalDiscProbeFigRoot') ...
             && ~isempty(config.paths.globalDiscProbeFigRoot)
@@ -8644,7 +9103,7 @@ function plot_rayleigh(U, stats, COL, config, outDir)
         if ~exist(globalDir,'dir'), mkdir(globalDir); end
     end
     
-    % ---------- Data Prep ----------
+    % --- DATA PREP ---
     win = U.winEarly;
     nTr = numel(U.spk);
     spk_early_count = nan(nTr,1);
@@ -8668,13 +9127,8 @@ function plot_rayleigh(U, stats, COL, config, outDir)
     satID  = U.trials.satID;
     elevID = U.trials.elevID;
     
-    % Determine Elevation for Color Lookup (Mode)
     uElevs = unique(elevID(~isnan(elevID)));
-    if isempty(uElevs)
-        currentElev = 0;
-    else
-        currentElev = mode(uElevs);
-    end
+    if isempty(uElevs), currentElev = 0; else, currentElev = mode(uElevs); end
     
     if isfield(COL, 'nHue')
         nHue = COL.nHue;
@@ -8682,29 +9136,34 @@ function plot_rayleigh(U, stats, COL, config, outDir)
         nHue = max(hueID(~isnan(hueID)));
     end
     
-    ZERO_HUE = 1;
+    % --- ANGLE ALIGNMENT ---
+    % Default to 16 if not specified, per your request
+    ZERO_HUE = 16; 
     if isfield(config, 'space') && isfield(config.space, 'zeroHue')
         ZERO_HUE = config.space.zeroHue;
     end
     
     thetaIdx        = hueID;
+    % Calculate radians relative to Zero Hue
+    % e.g. if Zero=16, then Hue 16 -> 0 rad. Hue 4 -> pi/2 rad (90 deg)
     thetaRad_trials = 2*pi * mod(thetaIdx - ZERO_HUE, nHue) / nHue;
+    
+    % Pre-calculate angles for drawing bars
     hueAngles       = 2*pi * mod((1:nHue) - ZERO_HUE, nHue) / nHue;
     hStep           = 360 / nHue;
     
     saturIDs = unique(satID(~isnan(satID)));
     saturIDs = saturIDs(:).';
     nSat     = numel(saturIDs);
+    if isempty(saturIDs), maxSat = 1; else, maxSat = max(saturIDs); end
     
     valid     = isfinite(thetaRad_trials) & isfinite(w_spk);
     theta_all = thetaRad_trials(valid);
     w_all     = w_spk(valid);
     
-    % --- Early Exits ---
-    if isempty(theta_all) || sum(w_all) == 0
-        return;
-    end
+    if isempty(theta_all) || sum(w_all) == 0, return; end
     
+    % Statistics
     [Rbar, mu_deg, z_all, p_all] = local_rayleigh(theta_all, w_all);
     
     spikes_total = sum(spk_early_count);
@@ -8713,20 +9172,20 @@ function plot_rayleigh(U, stats, COL, config, outDir)
     ws_overall   = normalize_to_one(sum_per_hue(thetaIdx(valid), w_all, nHue));
     prefHue_over = mod(round(mu_deg/hStep), nHue) + 1;
     
-    % --- FIXED COLOR LOOKUP (OVERALL) ---
-    maxSat = max(saturIDs);
-    % Use new robust helper
-    C_over = get_color_matrix_robust(U.trials, COL, nHue, maxSat, currentElev);
+    % --- Overall Color Map (Full Vivid) ---
+    C_over = zeros(nHue, 3);
+    for h = 1:nHue
+        C_over(h, :) = get_synthetic_color(COL, h, maxSat, maxSat, currentElev);
+    end
     
     % ---------- Figure Layout ----------
     figRay = figure('Name','Rayleigh (bars)','Color','w','Visible',figVis);
     
-    % Layout Sizing
     nCols = min(nSat, 4); if nCols < 1, nCols = 1; end
     nRowsSat = ceil(nSat / nCols);
     totalRows = 1 + nRowsSat;
     
-    t = tiledlayout(figRay, totalRows, nCols, 'TileSpacing','compact', 'Padding','compact');
+    t = tiledlayout(figRay, totalRows, nCols, 'TileSpacing','normal', 'Padding','compact');
 
     if isfield(U,'exptName')
         unitTag = sprintf('%s | Unit %d (%s)', string(U.exptName), U.unitID, U.unitType);
@@ -8735,13 +9194,12 @@ function plot_rayleigh(U, stats, COL, config, outDir)
     end
     sgtitle(figRay, unitTag, 'Interpreter','none');
     
-    figHeight = 300 + (nRowsSat * 250); 
+    figHeight = 350 + (nRowsSat * 300); 
     figWidth  = 300 * nCols;
     figRay.Position = [100, 100, min(figWidth, 1600), min(figHeight, 1000)];
 
     SPOKE_LW = 3.5;
     MU_LW    = 3.0;
-    STATS_FS = 10;
     ANG_EPS  = 1e-3;
     
     % --- Plot 1: Overall ---
@@ -8752,7 +9210,7 @@ function plot_rayleigh(U, stats, COL, config, outDir)
     
     title(ax0, 'Overall', 'FontWeight','bold');
     hold(ax0,'on');
-    style_polar(ax0, nHue, false);
+    style_polar(ax0);
     
     draw_spoke_bars_line(ax0, ws_overall, hueAngles, C_over, SPOKE_LW);
     
@@ -8762,10 +9220,9 @@ function plot_rayleigh(U, stats, COL, config, outDir)
     
     txt_over = sprintf('R=%.3f, p=%.4g, z=%.1f, \\mu=%0.0f^\\circ (hue %d)\nspikes=%d, trials=%d', ...
         Rbar, p_all, z_all, mu_deg, prefHue_over, spikes_total, trials_total);
-    
     title(ax0, { 'Overall', txt_over }, 'FontWeight','bold', 'FontSize', 9);
     
-    % --- Plot 2..N: Per-Sat Panels ---
+    % --- Per-Sat Panels ---
     for si = 1:nSat
         ax = nexttile(t);
         ax = polaraxes('Parent', t);
@@ -8773,7 +9230,7 @@ function plot_rayleigh(U, stats, COL, config, outDir)
         
         sVal = saturIDs(si);
         hold(ax,'on');
-        style_polar(ax, nHue, false);
+        style_polar(ax);
     
         sel  = satID == sVal & isfinite(thetaRad_trials) & isfinite(w_spk);
         th_i = thetaRad_trials(sel);
@@ -8789,16 +9246,17 @@ function plot_rayleigh(U, stats, COL, config, outDir)
             ws_si = normalize_to_one(sum_per_hue(thetaIdx(sel), w_i, nHue));
         end
     
-        % --- ROBUST COLOR LOOKUP ---
-        C_si = get_color_matrix_robust(U.trials, COL, nHue, sVal, currentElev);
+        % --- Synthetic Color for this Saturation ---
+        C_si = zeros(nHue, 3);
+        for h = 1:nHue
+            C_si(h, :) = get_synthetic_color(COL, h, sVal, maxSat, currentElev);
+        end
         
         draw_spoke_bars_line(ax, ws_si, hueAngles, C_si, SPOKE_LW);
         
         mu = deg2rad(mu_si);
         polarplot(ax,[mu-ANG_EPS mu+ANG_EPS],[0 Rsi],'-','LineWidth',MU_LW,'Color','k');
         polarplot(ax,mu,Rsi,'ko','MarkerFaceColor','k','MarkerSize',5);
-        
-        prefHue_si = mod(round(mu_si/hStep), nHue)+1;
         
         txt_si = sprintf('R=%.2f, p=%.3g\n\\mu=%0.0f^\\circ, n=%d', Rsi, p_si, mu_si, sp_si_count);
         title(ax, { sprintf('sat = %.2f', sVal), txt_si }, 'FontWeight','normal', 'FontSize', 8);
@@ -8829,29 +9287,35 @@ end
 function [Rbar, mu_deg, z, p] = local_rayleigh(thetaRad, w)
     thetaRad = thetaRad(:); w = w(:);
     C = sum(w .* cos(thetaRad)); S = sum(w .* sin(thetaRad)); W = sum(w);
-    Rbar = hypot(C,S) / max(W, eps);
-    mu = atan2(S, C); mu_deg = mod(rad2deg(mu), 360);
+    Rbar = hypot(C,S) / max(W, eps); mu = atan2(S, C); mu_deg = mod(rad2deg(mu), 360);
     z = W * Rbar.^2; p = exp(-z);
 end
 
 function x = normalize_to_one(x)
-    x = x(:);
-    if all(~isfinite(x)) || all(x==0 | isnan(x)), x(:)=0; return; end
-    x(x < 0) = 0; m = max(x);
-    if m > 0, x = x ./ m; end
+    x = x(:); if all(~isfinite(x)) || all(x==0 | isnan(x)), x(:)=0; return; end
+    x(x < 0) = 0; m = max(x); if m > 0, x = x ./ m; end
 end
 
 function ws = sum_per_hue(hueIdx, w, nHue)
-    hueIdx = hueIdx(:); w = w(:);
-    valid = isfinite(hueIdx) & isfinite(w) & hueIdx>=1 & hueIdx<=nHue;
+    hueIdx = hueIdx(:); w = w(:); valid = isfinite(hueIdx) & isfinite(w) & hueIdx>=1 & hueIdx<=nHue;
     ws = accumarray(hueIdx(valid), w(valid), [nHue 1], @sum, 0);
 end
 
-function style_polar(ax, nHue, showRadialLabels) %#ok<INUSD>
-    if nargin < 3, showRadialLabels = false; end
-    thetaticks(ax, 0:45:315); rticks(ax, 0:0.5:1); rlim(ax,[0 1]);
-    if ~showRadialLabels, ax.RTickLabel = {}; end
-    ax.ThetaZeroLocation = 'top'; ax.ThetaDir = 'clockwise';
+% -------------------------------------------------------------------------
+% POLAR STYLE: DKL Space (0 Right, 90 Top, No Axes)
+% -------------------------------------------------------------------------
+function style_polar(ax)
+    % Orientation
+    ax.ThetaZeroLocation = 'right';
+    ax.ThetaDir = 'counterclockwise';
+    
+    % Remove axis lines, grids, and ticks for clean look
+    ax.ThetaAxis.Visible = 'off';
+    ax.RAxis.Visible = 'off';
+    ax.GridColor = 'none';
+    ax.GridAlpha = 0;
+    
+    rlim(ax, [0 1]);
 end
 
 function draw_spoke_bars_line(ax, ws, hueAngles, C, lw)
@@ -8864,69 +9328,41 @@ function draw_spoke_bars_line(ax, ws, hueAngles, C, lw)
 end
 
 % -------------------------------------------------------------------------
-% SUPER ROBUST COLOR FETCH
+% Helper: Synthetic Color Scaling (Guarantees consistency)
 % -------------------------------------------------------------------------
-function cMat = get_color_matrix_robust(trials, COL, nHue, sVal, eVal)
-    cMat = repmat([0.5 0.5 0.5], nHue, 1);
+function c = get_synthetic_color(COL, h, sVal, maxSat, eVal)
+    % 1. Get Vivid Color (Max Saturation)
+    cVivid = get_vivid_color(COL, h, maxSat, eVal);
     
-    hasRGB = false;
-    if any(ismember(trials.Properties.VariableNames, {'R','G','B'}))
-        hasRGB = true; cMode = 'Split';
-    elseif any(ismember(trials.Properties.VariableNames, {'rgb','RGB','color','Color'}))
-        hasRGB = true; cMode = 'Vector';
+    % 2. Scale brightness by Saturation factor
+    if maxSat > 0
+        scaleFactor = sVal / maxSat;
+    else
+        scaleFactor = 0;
     end
     
-    for h = 1:nHue
-        c = [0.5 0.5 0.5];
-        if hasRGB
-            mask = (trials.hueID == h) & (abs(trials.satID - sVal) < 1e-4);
-            if any(mask)
-                firstIdx = find(mask, 1);
-                if strcmp(cMode, 'Split')
-                    c = [trials.R(firstIdx), trials.G(firstIdx), trials.B(firstIdx)];
-                else
-                    if ismember('rgb', trials.Properties.VariableNames), c = trials.rgb(firstIdx, :);
-                    elseif ismember('RGB', trials.Properties.VariableNames), c = trials.RGB(firstIdx, :);
-                    elseif ismember('color', trials.Properties.VariableNames), c = trials.color(firstIdx, :); end
-                end
-                if max(c) > 1.05, c = c / 255; end
-            else
-                c = get_color_from_meta_final(COL, h, sVal, eVal);
-            end
-        else
-            c = get_color_from_meta_final(COL, h, sVal, eVal);
-        end
-        cMat(h, :) = c;
-    end
+    c = cVivid * scaleFactor;
 end
 
-function c = get_color_from_meta_final(COL, h, s, e)
-    c = [0.5 0.5 0.5];
+function c = get_vivid_color(COL, h, maxSat, e)
+    c = [0.5 0.5 0.5]; 
     if ~isfield(COL, 'probeIDs') || ~isfield(COL, 'probeCols'), return; end
     tol = 1e-4; 
-    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
-    if isempty(idx)
-        idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1);
-    end
-    if isempty(idx)
-         idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol, 1);
-    end
-    if ~isempty(idx)
-        rawC = double(COL.probeCols(idx,:));
-        if max(rawC) > 1, rawC = rawC / 255; end
-        c = rawC;
-    end
+    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
+    if isempty(idx), idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1); end
+    if isempty(idx), idx = find(abs(COL.probeIDs(:,1)-h)<tol, 1); end
+    if ~isempty(idx), rawC = double(COL.probeCols(idx,:)); if max(rawC)>1, rawC=rawC/255; end; c=rawC; end
 end
 % ===== END FILE: core/visualization/plot_rayleigh.m =====
 
 % ===== FILE: core/visualization/plot_spike_accounting.m =====
 % ===== START =====
 function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
-% PLOT_SPIKE_ACCOUNTING - Visual QC of spike counts per condition.
+% PLOT_SPIKE_ACCOUNTING
 % FIXES: 
-% 1. Defines 'doSaveFig' variable (prevents crash).
-% 2. Double-locks visibility to 'off' (prevents pop-ups).
-% 3. Prioritizes RGB values directly from U.trials.
+% 1. Stats: Prints R^2, Amp, Peak on all panels.
+% 2. Labels: X-axis shows sparse DKL angles (0, 90, etc) instead of Hue Index.
+% 3. Colors: Uses Synthetic Scaling (VividColor * Saturation).
 
     if U.nTrials == 0
         return;
@@ -8946,12 +9382,10 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
         pngDpi = config.plot.dpi;
     end
     
-    % --- FIX: DEFINE doSaveFig HERE ---
     doSaveFig = true;
     if isfield(config, 'plot') && isfield(config.plot, 'saveFigs')
         doSaveFig = config.plot.saveFigs;
     end
-    % ----------------------------------
 
     sessionSubdir = 'spikeaccounting';
     if nargin >= 6 && ~isempty(varargin{1})
@@ -9041,18 +9475,18 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     saturIDs = saturIDs(:).';
     nSat = numel(saturIDs);
     
+    if isempty(saturIDs), maxSat = 1; else, maxSat = max(saturIDs); end
+
     % --- Pre-Calculate Stats ---
     N_hs = zeros(nHue, nSat);
     R_hs = nan(nHue, nSat);
     R_h  = nan(nHue, 1);
     
-    % Overall
     for h = 1:nHue
         sel = (hue_all == h);
         R_h(h) = mean(spk_early_norm(sel), 'omitnan');
     end
     
-    % Per Sat
     for si = 1:nSat
         sVal = saturIDs(si);
         selS = (sat_all == sVal);
@@ -9075,9 +9509,36 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     nRowsSat = max(1, ceil(nSat / nCols));
     totalRows = 1 + nRowsSat;
     
-    t = tiledlayout(figAcc, totalRows, nCols, 'TileSpacing','compact', 'Padding','compact');
+    t = tiledlayout(figAcc, totalRows, nCols, 'TileSpacing','normal', 'Padding','compact');
     
     if ~makePlots, set(figAcc, 'Visible', 'off'); end
+    
+    % --- AXIS LABELING ---
+    xtick_vals = 1:nHue;
+    xtick_labs = string(xtick_vals);
+    xlab_str   = 'Hue Index';
+    
+    isDKL = false;
+    ZERO_HUE = 1; 
+    
+    if isfield(config,'space') && isfield(config.space,'mode') && strcmpi(config.space.mode,'dkl')
+        isDKL = true;
+        if isfield(config.space, 'zeroHue'), ZERO_HUE = config.space.zeroHue; end
+        
+        stepDeg = 360 / nHue;
+        % Calculate angle for each hue index relative to Zero Hue
+        degrees = mod((xtick_vals - ZERO_HUE) * stepDeg, 360);
+        
+        % Sparse ticks: Label every 4th hue (assuming 16 total -> 0, 90, 180, 270)
+        xtick_labs = strings(1, nHue);
+        for i = 1:nHue
+            if mod(i-1, 4) == 0 % e.g. indices 1, 5, 9, 13
+                d = degrees(i);
+                xtick_labs(i) = sprintf('%.0f°', d);
+            end
+        end
+        xlab_str = 'Angle (deg)';
+    end
     
     % --- TOP ROW ---
     ax1 = nexttile(t, 1);
@@ -9090,13 +9551,14 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     for si = 1:nSat
         if si <= numel(b1)
             thisSat = saturIDs(si);
-            cDataGroup = get_color_matrix(U.trials, COL, nHue, thisSat, currentElev);
+            cDataGroup = get_color_matrix_synthetic(COL, nHue, thisSat, maxSat, currentElev);
             b1(si).CData = cDataGroup;
             b1(si).FaceColor = 'flat';
         end
     end
-    xlabel(ax1,'Hue'); ylabel(ax1,'Norm. Rate'); title(ax1,'Rate per Hue (Grouped)');
+    title(ax1,'Rate per Hue (Grouped)'); ylabel(ax1,'Norm. Rate');
     grid(ax1,'on'); xlim(ax1,[0.5, nHue+0.5]);
+    xticks(ax1, xtick_vals); xticklabels(ax1, xtick_labs); xlabel(ax1, xlab_str);
     
     % Panel 2: GROUPED Trial Counts
     axes(ax2); hold(ax2,'on'); %#ok<LAXES>
@@ -9104,28 +9566,26 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     for si = 1:nSat
         if si <= numel(b2)
             thisSat = saturIDs(si);
-            cDataGroup = get_color_matrix(U.trials, COL, nHue, thisSat, currentElev);
+            cDataGroup = get_color_matrix_synthetic(COL, nHue, thisSat, maxSat, currentElev);
             b2(si).CData = cDataGroup;
             b2(si).FaceColor = 'flat';
         end
     end
-    xlabel(ax2,'Hue'); ylabel(ax2,'Trials'); title(ax2,'Trials per Hue (Grouped)');
+    title(ax2,'Trials per Hue (Grouped)'); ylabel(ax2,'Trials');
     grid(ax2,'on'); xlim(ax2,[0.5, nHue+0.5]);
+    xticks(ax2, xtick_vals); xticklabels(ax2, xtick_labs); xlabel(ax2, xlab_str);
     
     % Panel 3: Overall Tuning
     axes(ax3); hold(ax3,'on'); %#ok<LAXES>
     b3 = bar(ax3, 1:nHue, R_h);
-    
-    % For overall, we use Max Saturation colors (usually mostly vibrant)
-    maxSat = max(saturIDs);
-    cDataOverall = get_color_matrix(U.trials, COL, nHue, maxSat, currentElev);
-    
+    cDataOverall = get_color_matrix_synthetic(COL, nHue, maxSat, maxSat, currentElev);
     b3.CData = cDataOverall;
     b3.FaceColor = 'flat';
-    xlabel(ax3,'Hue'); ylabel(ax3,'Norm. Rate'); title(ax3,'Overall Tuning');
+    title(ax3,'Overall Tuning'); ylabel(ax3,'Norm. Rate');
     grid(ax3,'on'); xlim(ax3,[0.5, nHue+0.5]);
+    xticks(ax3, xtick_vals); xticklabels(ax3, xtick_labs); xlabel(ax3, xlab_str);
     
-    % Fit Cosine for Overall
+    % Fit Cosine for Overall + Stats (Amp, Peak, R2)
     hx = linspace(1, nHue, 300);
     x_hue = (0:(nHue-1)).';
     if nHue >= 3
@@ -9136,10 +9596,32 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
         y_recon = beta(1) + beta(2)*cos(th_smooth) + beta(3)*sin(th_smooth);
         plot(ax3, hx, y_recon, 'k-','LineWidth',1.5);
         
-        % Stats
+        % Calculate Stats
+        y_hat = Xcos * beta;
+        SS_res = sum((y_hue - y_hat).^2, 'omitnan');
+        SS_tot = sum((y_hue - mean(y_hue, 'omitnan')).^2, 'omitnan');
+        R2 = 1 - (SS_res / SS_tot);
+        if SS_tot < 1e-9, R2 = NaN; end
+        
         B = beta(2) + 1i*beta(3);
-        peakDeg = rad2deg(angle(B)); if peakDeg < 0, peakDeg=peakDeg+360; end
-        txtStats = sprintf('amp=%.2f, peak=%d°', abs(B), round(peakDeg));
+        
+        if isDKL
+             % Calculate Peak in DKL Degrees
+             pkPh = angle(B); 
+             if pkPh < 0, pkPh = pkPh + 2*pi; end
+             % Convert Phase (0..2pi) to Index Scale (0..360) then shift by ZeroHue
+             pkDegIndex = rad2deg(pkPh); 
+             % Shift: If ZeroHue is 16, Index 16 is 0 deg.
+             % Angle = (Index - ZeroHue) * Step
+             % Phase corresponds to "Index - 1".
+             % So: DKL = PhaseDeg - (ZeroHue-1)*Step
+             peakDegDisplay = mod(pkDegIndex - (ZERO_HUE-1)*(360/nHue), 360);
+        else
+             peakDeg = rad2deg(angle(B)); if peakDeg<0, peakDeg=peakDeg+360; end
+             peakDegDisplay = peakDeg;
+        end
+        
+        txtStats = sprintf('amp=%.2f, pk=%.0f°, R^2=%.2f', abs(B), peakDegDisplay, R2);
         text(ax3, 0.02, 0.98, txtStats, 'Units','normalized','VerticalAlignment','top','FontSize',9,'EdgeColor','none');
     end
     
@@ -9153,9 +9635,7 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
         yy = R_hs(:,si);
         bSat = bar(ax, 1:nHue, yy);
         
-        % Get colors specifically for this Saturation
-        cDataSat = get_color_matrix(U.trials, COL, nHue, sVal, currentElev);
-        
+        cDataSat = get_color_matrix_synthetic(COL, nHue, sVal, maxSat, currentElev);
         bSat.CData = cDataSat;
         bSat.FaceColor = 'flat';
         
@@ -9165,15 +9645,32 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
             y_recon_i = beta_i(1) + beta_i(2)*cos(th_smooth) + beta_i(3)*sin(th_smooth);
             plot(ax, hx, y_recon_i, 'k-','LineWidth',1.0);
             
+            % Calc R2 & Stats per sat
+            y_hat_s = Xcos * beta_i;
+            SS_res_s = sum((y_s - y_hat_s).^2, 'omitnan');
+            SS_tot_s = sum((y_s - mean(y_s, 'omitnan')).^2, 'omitnan');
+            R2_s = 1 - (SS_res_s / SS_tot_s);
+            if SS_tot_s < 1e-9, R2_s = NaN; end
+            
             Bi = beta_i(2) + 1i*beta_i(3);
-            pkDegI = rad2deg(angle(Bi)); if pkDegI<0, pkDegI=pkDegI+360; end
-            txtI = sprintf('amp=%.2f, pk=%d°', abs(Bi), round(pkDegI));
+            
+            if isDKL
+                 pkPh = angle(Bi); if pkPh<0, pkPh=pkPh+2*pi; end
+                 pkDegIndex = rad2deg(pkPh);
+                 pkDegDisplay = mod(pkDegIndex - (ZERO_HUE-1)*(360/nHue), 360);
+            else
+                 pkDegI = rad2deg(angle(Bi)); if pkDegI<0, pkDegI=pkDegI+360; end
+                 peakDegDisplay = pkDegI;
+            end
+            
+            txtI = sprintf('amp=%.2f, pk=%.0f°, R^2=%.2f', abs(Bi), peakDegDisplay, R2_s);
             text(ax, 0.02, 0.98, txtI, 'Units','normalized','VerticalAlignment','top','FontSize',8,'EdgeColor','none');
         end
         
-        xlabel(ax,'Hue'); 
         title(ax, sprintf('Sat=%.2f', sVal));
         grid(ax,'on'); xlim(ax,[0.5, nHue+0.5]);
+        xticks(ax, xtick_vals); xticklabels(ax, xtick_labs); 
+        if si > nSat - 3, xlabel(ax, xlab_str); end
     end
     
     % --- TITLE & SAVING ---
@@ -9186,7 +9683,6 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     
     baseName = sprintf('%s_%s_%d_spikeaccounting', dateStr, unitType, unitID);
     exportgraphics(figAcc, fullfile(unitDir, [baseName '.png']), 'Resolution', pngDpi);
-    
     if doSaveFig, savefig(figAcc, fullfile(unitDir, [baseName '.fig'])); end
     
     if ~isempty(sessionDir)
@@ -9202,79 +9698,43 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
 end
 
 % -------------------------------------------------------------------------
-% Helper: Get entire color matrix (nHue x 3) for a given Saturation/Elev
-% Priority: U.trials table > COL metadata
+% Helper: Synthetic Color Scaling (Guarantees consistency)
 % -------------------------------------------------------------------------
-function cMat = get_color_matrix(trials, COL, nHue, sVal, eVal)
+function cMat = get_color_matrix_synthetic(COL, nHue, sVal, maxSat, eVal)
     cMat = repmat([0.5 0.5 0.5], nHue, 1);
     
-    % Check if trials table has color info (R,G,B or rgb)
-    hasRGB = false;
-    if any(ismember(trials.Properties.VariableNames, {'R','G','B'}))
-        hasRGB = true;
-        cMode = 'Split'; % R, G, B columns
-    elseif any(ismember(trials.Properties.VariableNames, {'rgb','RGB','color','Color'}))
-        hasRGB = true;
-        cMode = 'Vector'; % Single column with [r g b] vectors
-    end
-    
     for h = 1:nHue
-        % Default fallback
-        c = [0.5 0.5 0.5];
+        % 1. Get Vivid Color (Max Saturation)
+        cVivid = get_vivid_color(COL, h, maxSat, eVal);
         
-        if hasRGB
-            % 1. Try fetching from Trials directly
-            % Find trials matching this H, S, E
-            mask = (trials.hueID == h) & (abs(trials.satID - sVal) < 1e-4);
-            
-            if any(mask)
-                firstIdx = find(mask, 1);
-                if strcmp(cMode, 'Split')
-                    c = [trials.R(firstIdx), trials.G(firstIdx), trials.B(firstIdx)];
-                else
-                    % Handle different vector names
-                    if ismember('rgb', trials.Properties.VariableNames)
-                        c = trials.rgb(firstIdx, :);
-                    elseif ismember('RGB', trials.Properties.VariableNames)
-                        c = trials.RGB(firstIdx, :);
-                    elseif ismember('color', trials.Properties.VariableNames)
-                        c = trials.color(firstIdx, :);
-                    end
-                end
-                
-                % Normalize if 0-255
-                if max(c) > 1.05
-                    c = c / 255;
-                end
-            else
-                % If no trials found for this specific combo, fallback to meta
-                c = get_color_from_meta_robust(COL, h, sVal, eVal);
-            end
+        % 2. Scale brightness by Saturation factor
+        % (Assuming Sat=0 is dark/black context, common for bar plots on white)
+        if maxSat > 0
+            scaleFactor = sVal / maxSat;
         else
-            % 2. No RGB in table? Use Robust Metadata Lookup
-            c = get_color_from_meta_robust(COL, h, sVal, eVal);
+            scaleFactor = 0;
         end
         
-        cMat(h, :) = c;
+        cMat(h, :) = cVivid * scaleFactor; 
     end
 end
 
-function c = get_color_from_meta_robust(COL, h, s, e)
-    c = [0.5 0.5 0.5];
+function c = get_vivid_color(COL, h, maxSat, e)
+    c = [0.5 0.5 0.5]; 
     if ~isfield(COL, 'probeIDs') || ~isfield(COL, 'probeCols'), return; end
-    tol = 1e-4;
+    tol = 1e-4; 
     
-    % 1. Exact
-    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
+    % Try strict match for Max Sat
+    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
     
-    % 2. Fallback (Ignore Elev - treat as Equator)
+    % Fallback to Equator
     if isempty(idx)
-        idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1);
+        idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1);
     end
     
-    % 3. Desperate (Ignore Elev & Sat match - just find Hue? Risk of wrong saturation color)
+    % Fallback to Hue only (any elevation/sat if max sat missing)
     if isempty(idx)
-         idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol, 1);
+         idx = find(abs(COL.probeIDs(:,1)-h)<tol, 1);
     end
 
     if ~isempty(idx)

@@ -1,9 +1,9 @@
 function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
-% PLOT_SPIKE_ACCOUNTING - Visual QC of spike counts per condition.
+% PLOT_SPIKE_ACCOUNTING
 % FIXES: 
-% 1. Defines 'doSaveFig' variable (prevents crash).
-% 2. Double-locks visibility to 'off' (prevents pop-ups).
-% 3. Prioritizes RGB values directly from U.trials.
+% 1. Stats: Prints R^2, Amp, Peak on all panels.
+% 2. Labels: X-axis shows sparse DKL angles (0, 90, etc) instead of Hue Index.
+% 3. Colors: Uses Synthetic Scaling (VividColor * Saturation).
 
     if U.nTrials == 0
         return;
@@ -23,12 +23,10 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
         pngDpi = config.plot.dpi;
     end
     
-    % --- FIX: DEFINE doSaveFig HERE ---
     doSaveFig = true;
     if isfield(config, 'plot') && isfield(config.plot, 'saveFigs')
         doSaveFig = config.plot.saveFigs;
     end
-    % ----------------------------------
 
     sessionSubdir = 'spikeaccounting';
     if nargin >= 6 && ~isempty(varargin{1})
@@ -118,18 +116,18 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     saturIDs = saturIDs(:).';
     nSat = numel(saturIDs);
     
+    if isempty(saturIDs), maxSat = 1; else, maxSat = max(saturIDs); end
+
     % --- Pre-Calculate Stats ---
     N_hs = zeros(nHue, nSat);
     R_hs = nan(nHue, nSat);
     R_h  = nan(nHue, 1);
     
-    % Overall
     for h = 1:nHue
         sel = (hue_all == h);
         R_h(h) = mean(spk_early_norm(sel), 'omitnan');
     end
     
-    % Per Sat
     for si = 1:nSat
         sVal = saturIDs(si);
         selS = (sat_all == sVal);
@@ -152,9 +150,36 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     nRowsSat = max(1, ceil(nSat / nCols));
     totalRows = 1 + nRowsSat;
     
-    t = tiledlayout(figAcc, totalRows, nCols, 'TileSpacing','compact', 'Padding','compact');
+    t = tiledlayout(figAcc, totalRows, nCols, 'TileSpacing','normal', 'Padding','compact');
     
     if ~makePlots, set(figAcc, 'Visible', 'off'); end
+    
+    % --- AXIS LABELING ---
+    xtick_vals = 1:nHue;
+    xtick_labs = string(xtick_vals);
+    xlab_str   = 'Hue Index';
+    
+    isDKL = false;
+    ZERO_HUE = 1; 
+    
+    if isfield(config,'space') && isfield(config.space,'mode') && strcmpi(config.space.mode,'dkl')
+        isDKL = true;
+        if isfield(config.space, 'zeroHue'), ZERO_HUE = config.space.zeroHue; end
+        
+        stepDeg = 360 / nHue;
+        % Calculate angle for each hue index relative to Zero Hue
+        degrees = mod((xtick_vals - ZERO_HUE) * stepDeg, 360);
+        
+        % Sparse ticks: Label every 4th hue (assuming 16 total -> 0, 90, 180, 270)
+        xtick_labs = strings(1, nHue);
+        for i = 1:nHue
+            if mod(i-1, 4) == 0 % e.g. indices 1, 5, 9, 13
+                d = degrees(i);
+                xtick_labs(i) = sprintf('%.0f°', d);
+            end
+        end
+        xlab_str = 'Angle (deg)';
+    end
     
     % --- TOP ROW ---
     ax1 = nexttile(t, 1);
@@ -167,13 +192,14 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     for si = 1:nSat
         if si <= numel(b1)
             thisSat = saturIDs(si);
-            cDataGroup = get_color_matrix(U.trials, COL, nHue, thisSat, currentElev);
+            cDataGroup = get_color_matrix_synthetic(COL, nHue, thisSat, maxSat, currentElev);
             b1(si).CData = cDataGroup;
             b1(si).FaceColor = 'flat';
         end
     end
-    xlabel(ax1,'Hue'); ylabel(ax1,'Norm. Rate'); title(ax1,'Rate per Hue (Grouped)');
+    title(ax1,'Rate per Hue (Grouped)'); ylabel(ax1,'Norm. Rate');
     grid(ax1,'on'); xlim(ax1,[0.5, nHue+0.5]);
+    xticks(ax1, xtick_vals); xticklabels(ax1, xtick_labs); xlabel(ax1, xlab_str);
     
     % Panel 2: GROUPED Trial Counts
     axes(ax2); hold(ax2,'on'); %#ok<LAXES>
@@ -181,28 +207,26 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     for si = 1:nSat
         if si <= numel(b2)
             thisSat = saturIDs(si);
-            cDataGroup = get_color_matrix(U.trials, COL, nHue, thisSat, currentElev);
+            cDataGroup = get_color_matrix_synthetic(COL, nHue, thisSat, maxSat, currentElev);
             b2(si).CData = cDataGroup;
             b2(si).FaceColor = 'flat';
         end
     end
-    xlabel(ax2,'Hue'); ylabel(ax2,'Trials'); title(ax2,'Trials per Hue (Grouped)');
+    title(ax2,'Trials per Hue (Grouped)'); ylabel(ax2,'Trials');
     grid(ax2,'on'); xlim(ax2,[0.5, nHue+0.5]);
+    xticks(ax2, xtick_vals); xticklabels(ax2, xtick_labs); xlabel(ax2, xlab_str);
     
     % Panel 3: Overall Tuning
     axes(ax3); hold(ax3,'on'); %#ok<LAXES>
     b3 = bar(ax3, 1:nHue, R_h);
-    
-    % For overall, we use Max Saturation colors (usually mostly vibrant)
-    maxSat = max(saturIDs);
-    cDataOverall = get_color_matrix(U.trials, COL, nHue, maxSat, currentElev);
-    
+    cDataOverall = get_color_matrix_synthetic(COL, nHue, maxSat, maxSat, currentElev);
     b3.CData = cDataOverall;
     b3.FaceColor = 'flat';
-    xlabel(ax3,'Hue'); ylabel(ax3,'Norm. Rate'); title(ax3,'Overall Tuning');
+    title(ax3,'Overall Tuning'); ylabel(ax3,'Norm. Rate');
     grid(ax3,'on'); xlim(ax3,[0.5, nHue+0.5]);
+    xticks(ax3, xtick_vals); xticklabels(ax3, xtick_labs); xlabel(ax3, xlab_str);
     
-    % Fit Cosine for Overall
+    % Fit Cosine for Overall + Stats (Amp, Peak, R2)
     hx = linspace(1, nHue, 300);
     x_hue = (0:(nHue-1)).';
     if nHue >= 3
@@ -213,10 +237,32 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
         y_recon = beta(1) + beta(2)*cos(th_smooth) + beta(3)*sin(th_smooth);
         plot(ax3, hx, y_recon, 'k-','LineWidth',1.5);
         
-        % Stats
+        % Calculate Stats
+        y_hat = Xcos * beta;
+        SS_res = sum((y_hue - y_hat).^2, 'omitnan');
+        SS_tot = sum((y_hue - mean(y_hue, 'omitnan')).^2, 'omitnan');
+        R2 = 1 - (SS_res / SS_tot);
+        if SS_tot < 1e-9, R2 = NaN; end
+        
         B = beta(2) + 1i*beta(3);
-        peakDeg = rad2deg(angle(B)); if peakDeg < 0, peakDeg=peakDeg+360; end
-        txtStats = sprintf('amp=%.2f, peak=%d°', abs(B), round(peakDeg));
+        
+        if isDKL
+             % Calculate Peak in DKL Degrees
+             pkPh = angle(B); 
+             if pkPh < 0, pkPh = pkPh + 2*pi; end
+             % Convert Phase (0..2pi) to Index Scale (0..360) then shift by ZeroHue
+             pkDegIndex = rad2deg(pkPh); 
+             % Shift: If ZeroHue is 16, Index 16 is 0 deg.
+             % Angle = (Index - ZeroHue) * Step
+             % Phase corresponds to "Index - 1".
+             % So: DKL = PhaseDeg - (ZeroHue-1)*Step
+             peakDegDisplay = mod(pkDegIndex - (ZERO_HUE-1)*(360/nHue), 360);
+        else
+             peakDeg = rad2deg(angle(B)); if peakDeg<0, peakDeg=peakDeg+360; end
+             peakDegDisplay = peakDeg;
+        end
+        
+        txtStats = sprintf('amp=%.2f, pk=%.0f°, R^2=%.2f', abs(B), peakDegDisplay, R2);
         text(ax3, 0.02, 0.98, txtStats, 'Units','normalized','VerticalAlignment','top','FontSize',9,'EdgeColor','none');
     end
     
@@ -230,9 +276,7 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
         yy = R_hs(:,si);
         bSat = bar(ax, 1:nHue, yy);
         
-        % Get colors specifically for this Saturation
-        cDataSat = get_color_matrix(U.trials, COL, nHue, sVal, currentElev);
-        
+        cDataSat = get_color_matrix_synthetic(COL, nHue, sVal, maxSat, currentElev);
         bSat.CData = cDataSat;
         bSat.FaceColor = 'flat';
         
@@ -242,15 +286,32 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
             y_recon_i = beta_i(1) + beta_i(2)*cos(th_smooth) + beta_i(3)*sin(th_smooth);
             plot(ax, hx, y_recon_i, 'k-','LineWidth',1.0);
             
+            % Calc R2 & Stats per sat
+            y_hat_s = Xcos * beta_i;
+            SS_res_s = sum((y_s - y_hat_s).^2, 'omitnan');
+            SS_tot_s = sum((y_s - mean(y_s, 'omitnan')).^2, 'omitnan');
+            R2_s = 1 - (SS_res_s / SS_tot_s);
+            if SS_tot_s < 1e-9, R2_s = NaN; end
+            
             Bi = beta_i(2) + 1i*beta_i(3);
-            pkDegI = rad2deg(angle(Bi)); if pkDegI<0, pkDegI=pkDegI+360; end
-            txtI = sprintf('amp=%.2f, pk=%d°', abs(Bi), round(pkDegI));
+            
+            if isDKL
+                 pkPh = angle(Bi); if pkPh<0, pkPh=pkPh+2*pi; end
+                 pkDegIndex = rad2deg(pkPh);
+                 pkDegDisplay = mod(pkDegIndex - (ZERO_HUE-1)*(360/nHue), 360);
+            else
+                 pkDegI = rad2deg(angle(Bi)); if pkDegI<0, pkDegI=pkDegI+360; end
+                 peakDegDisplay = pkDegI;
+            end
+            
+            txtI = sprintf('amp=%.2f, pk=%.0f°, R^2=%.2f', abs(Bi), peakDegDisplay, R2_s);
             text(ax, 0.02, 0.98, txtI, 'Units','normalized','VerticalAlignment','top','FontSize',8,'EdgeColor','none');
         end
         
-        xlabel(ax,'Hue'); 
         title(ax, sprintf('Sat=%.2f', sVal));
         grid(ax,'on'); xlim(ax,[0.5, nHue+0.5]);
+        xticks(ax, xtick_vals); xticklabels(ax, xtick_labs); 
+        if si > nSat - 3, xlabel(ax, xlab_str); end
     end
     
     % --- TITLE & SAVING ---
@@ -263,7 +324,6 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
     
     baseName = sprintf('%s_%s_%d_spikeaccounting', dateStr, unitType, unitID);
     exportgraphics(figAcc, fullfile(unitDir, [baseName '.png']), 'Resolution', pngDpi);
-    
     if doSaveFig, savefig(figAcc, fullfile(unitDir, [baseName '.fig'])); end
     
     if ~isempty(sessionDir)
@@ -279,79 +339,43 @@ function plot_spike_accounting(U, stats, COL, config, outDir, varargin)
 end
 
 % -------------------------------------------------------------------------
-% Helper: Get entire color matrix (nHue x 3) for a given Saturation/Elev
-% Priority: U.trials table > COL metadata
+% Helper: Synthetic Color Scaling (Guarantees consistency)
 % -------------------------------------------------------------------------
-function cMat = get_color_matrix(trials, COL, nHue, sVal, eVal)
+function cMat = get_color_matrix_synthetic(COL, nHue, sVal, maxSat, eVal)
     cMat = repmat([0.5 0.5 0.5], nHue, 1);
     
-    % Check if trials table has color info (R,G,B or rgb)
-    hasRGB = false;
-    if any(ismember(trials.Properties.VariableNames, {'R','G','B'}))
-        hasRGB = true;
-        cMode = 'Split'; % R, G, B columns
-    elseif any(ismember(trials.Properties.VariableNames, {'rgb','RGB','color','Color'}))
-        hasRGB = true;
-        cMode = 'Vector'; % Single column with [r g b] vectors
-    end
-    
     for h = 1:nHue
-        % Default fallback
-        c = [0.5 0.5 0.5];
+        % 1. Get Vivid Color (Max Saturation)
+        cVivid = get_vivid_color(COL, h, maxSat, eVal);
         
-        if hasRGB
-            % 1. Try fetching from Trials directly
-            % Find trials matching this H, S, E
-            mask = (trials.hueID == h) & (abs(trials.satID - sVal) < 1e-4);
-            
-            if any(mask)
-                firstIdx = find(mask, 1);
-                if strcmp(cMode, 'Split')
-                    c = [trials.R(firstIdx), trials.G(firstIdx), trials.B(firstIdx)];
-                else
-                    % Handle different vector names
-                    if ismember('rgb', trials.Properties.VariableNames)
-                        c = trials.rgb(firstIdx, :);
-                    elseif ismember('RGB', trials.Properties.VariableNames)
-                        c = trials.RGB(firstIdx, :);
-                    elseif ismember('color', trials.Properties.VariableNames)
-                        c = trials.color(firstIdx, :);
-                    end
-                end
-                
-                % Normalize if 0-255
-                if max(c) > 1.05
-                    c = c / 255;
-                end
-            else
-                % If no trials found for this specific combo, fallback to meta
-                c = get_color_from_meta_robust(COL, h, sVal, eVal);
-            end
+        % 2. Scale brightness by Saturation factor
+        % (Assuming Sat=0 is dark/black context, common for bar plots on white)
+        if maxSat > 0
+            scaleFactor = sVal / maxSat;
         else
-            % 2. No RGB in table? Use Robust Metadata Lookup
-            c = get_color_from_meta_robust(COL, h, sVal, eVal);
+            scaleFactor = 0;
         end
         
-        cMat(h, :) = c;
+        cMat(h, :) = cVivid * scaleFactor; 
     end
 end
 
-function c = get_color_from_meta_robust(COL, h, s, e)
-    c = [0.5 0.5 0.5];
+function c = get_vivid_color(COL, h, maxSat, e)
+    c = [0.5 0.5 0.5]; 
     if ~isfield(COL, 'probeIDs') || ~isfield(COL, 'probeCols'), return; end
-    tol = 1e-4;
+    tol = 1e-4; 
     
-    % 1. Exact
-    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
+    % Try strict match for Max Sat
+    idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-e)<tol, 1);
     
-    % 2. Fallback (Ignore Elev - treat as Equator)
+    % Fallback to Equator
     if isempty(idx)
-        idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1);
+        idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-maxSat)<tol & abs(COL.probeIDs(:,3)-0)<tol, 1);
     end
     
-    % 3. Desperate (Ignore Elev & Sat match - just find Hue? Risk of wrong saturation color)
+    % Fallback to Hue only (any elevation/sat if max sat missing)
     if isempty(idx)
-         idx = find(abs(COL.probeIDs(:,1)-h)<tol & abs(COL.probeIDs(:,2)-s)<tol, 1);
+         idx = find(abs(COL.probeIDs(:,1)-h)<tol, 1);
     end
 
     if ~isempty(idx)

@@ -1,38 +1,20 @@
-function dates = normalize_dates(D)
-% Normalize various date input formats into a cellstr of 'YYMMDD' char rows.
-
-% single char, like '250513'
-if ischar(D)
-    dates = {char(D)};
-    return;
-end
-
-% string or string array
-if isstring(D)
-    if isscalar(D)
-        dates = {char(D)};
-    else
-        dates = cellstr(D);
+function DATES = normalize_dates(inputDATES, config)
+% Converts 'all', strings, or cells into a standard cell array of date strings.
+    if nargin < 1 || isempty(inputDATES)
+        inputDATES = 'all';
     end
-    return;
-end
-
-% cell array of anything string-like
-if iscell(D)
-    % convert each element to char
-    dates = cellfun(@char, D, 'UniformOutput', false);
-    return;
-end
-
-% numeric or other weird types – try to be forgiving
-if isnumeric(D)
-    % assume rows or elements are datenum-like or YYMMDD-ish, convert via num2str
-    D = num2cell(D);
-    dates = cellfun(@(x) char(string(x)), D, 'UniformOutput', false);
-    return;
-end
-
-% fallback
-dates = {char(string(D))};
-
+    
+    if (ischar(inputDATES) || isstring(inputDATES)) && strcmpi(strtrim(inputDATES), 'all')
+        % Look in the base data directory
+        d = dir(config.paths.base);
+        names = {d([d.isdir]).name};
+        % Find folders containing 6 digits (the date)
+        validIdx = cellfun(@(s) ~isempty(regexp(s, '\d{6}', 'once')), names) & ...
+                   ~ismember(names, {'.','..'});
+        DATES = sort(names(validIdx));
+    elseif ischar(inputDATES) || isstring(inputDATES)
+        DATES = {char(inputDATES)};
+    else
+        DATES = cellstr(inputDATES);
+    end
 end
